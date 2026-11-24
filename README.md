@@ -41,6 +41,8 @@ that upstream never merged:
   - Fall back to the HTTP/2 `:authority` pseudo-header in the origin check (#1592).
   - Keep the copied argv NULL-terminated (#1576).
   - Update the frontend toolchain to patched webpack / webpack-dev-server versions.
+  - Expire unauthenticated WebSocket connections so they cannot hold a
+    `--max-clients` / `--once` slot indefinitely.
 - **Bug fixes**
   - Keep reading the PTY after a zero-byte read instead of stalling the terminal
     forever (#1573).

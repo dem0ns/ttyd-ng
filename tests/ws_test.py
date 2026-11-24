@@ -203,6 +203,60 @@ def test_empty_final_fragment_completes_message():
         s.close()
 
 
+def test_auth_token_flow():
+    """Browsers that omit Basic credentials can authenticate with AuthToken."""
+    token = base64.b64encode(b"user:pass").decode()
+    with Server("-W", "-c", "user:pass", "bash") as srv:
+        # No Authorization header: the upgrade is accepted, AuthToken decides.
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s, auth_token=token)
+        data = ws_drain(s, 1.5)
+        assert len(data) > 0, "no initial messages after AuthToken"
+        ws_frame(s, 2, b"0echo TOKEN-OK\n")
+        data = ws_drain(s, 1.5)
+        assert b"TOKEN-OK" in data, "unable to write after AuthToken"
+        s.close()
+
+        # A wrong token closes the connection.
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s, auth_token="wrong")
+        closed = False
+        s.settimeout(3)
+        try:
+            while True:
+                d = s.recv(4096)
+                if not d or (d[0] & 0x0F) == 0x8:
+                    closed = True
+                    break
+        except (socket.timeout, OSError):
+            pass
+        assert closed, "connection not closed after a bad AuthToken"
+        s.close()
+
+
+def test_unauthenticated_idle_connection_times_out():
+    """An unauthenticated WS must not hold a max-clients/--once slot forever."""
+    with Server("-W", "-c", "user:pass", "bash") as srv:
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        s.settimeout(9)
+        closed = False
+        try:
+            while True:
+                d = s.recv(4096)
+                if not d:
+                    closed = True
+                    break
+        except socket.timeout:
+            pass
+        except OSError:
+            closed = True
+        assert closed, "unauthenticated connection was not closed by the timeout"
+        s.close()
+
+
 def test_flood_message_capped():  # unbounded fragment accumulation
     with Server("-W", "bash") as srv:
         s, first = ws_connect(srv.port)

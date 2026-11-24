@@ -275,6 +275,13 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       pss->wsi = wsi;
       pss->lws_close_status = LWS_CLOSE_STATUS_NOSTATUS;
 
+      if (server->credential != NULL) {
+        // Browsers may skip the Basic credentials on the WS handshake and
+        // authenticate with the AuthToken instead. Do not let such a connection
+        // occupy a --max-clients / --once slot indefinitely without auth.
+        lws_set_timeout(wsi, PENDING_TIMEOUT_AWAITING_CLIENT_HS_SEND, 5);
+      }
+
       if (server->url_arg) {
         while (lws_hdr_copy_fragment(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_URI_ARGS, n++) > 0) {
           if (strncmp(buf, "arg=", 4) == 0) {
@@ -402,8 +409,10 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
             struct json_object *o = NULL;
             if (json_object_object_get_ex(obj, "AuthToken", &o)) {
               const char *token = json_object_get_string(o);
-              if (token != NULL && !strcmp(token, server->credential))
+              if (token != NULL && !strcmp(token, server->credential)) {
                 pss->authenticated = true;
+                lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
+              }
               else
                 lwsl_warn("WS authentication failed with token: %s\n", token);
             }
