@@ -1,15 +1,19 @@
-FROM alpine
+FROM alpine:3.24
 
 ARG TARGETARCH
 
 # Dependencies
-RUN apk add --no-cache bash tini
+RUN apk add --no-cache bash tini \
+    && adduser -D -u 1000 -s /bin/bash ttyd
 
 # Application
 COPY ./dist/${TARGETARCH}/ttyd /usr/bin/ttyd
 
 EXPOSE 7681
-WORKDIR /root
+WORKDIR /home/ttyd
+# Do not hand out a root shell by default; use `--user root` if you really
+# want the old behaviour.
+USER ttyd
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["ttyd", "-W", "bash"]

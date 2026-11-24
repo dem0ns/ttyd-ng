@@ -1,5 +1,8 @@
 name: backend
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   push:
@@ -28,11 +31,14 @@ jobs:
       TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Checkout vcpkg
         uses: actions/checkout@v6
         with:
           repository: microsoft/vcpkg
           path: vcpkg
+          persist-credentials: false
       - name: Bootstrap vcpkg
         shell: pwsh
         run: ${{ github.workspace }}/vcpkg/bootstrap-vcpkg.bat
@@ -59,6 +65,8 @@ jobs:
         target: [i686, x86_64, arm, armhf, aarch64, mips, mipsel, mips64, mips64el, ppc64, ppc64le, s390x, win32]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install packages
         run: |
           sudo apt-get update
@@ -86,6 +94,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install CMake
         # CMake is a build-time tool only -- never linked into the binary. It
         # comes from the runner's preinstalled Homebrew. (pkg-config isn't
@@ -107,6 +117,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           sudo apt-get update

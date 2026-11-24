@@ -1,8 +1,9 @@
 name: ttyd
 adopt-info: ttyd
-summary: Share your terminal over the web
+summary: Share your terminal over the web (ttyd-ng)
 description: |
- ttyd is a simple command-line tool for sharing terminal over the web
+ ttyd-ng is a community-maintained fork of ttyd, a simple command-line tool
+ for sharing a terminal over the web.
 
 grade: stable
 confinement: classic
@@ -22,8 +23,9 @@ apps:
 
 parts:
   ttyd:
-    source: https://github.com/tsl0922/ttyd
-    source-type: git
+    # Build the tree this snapcraft.yaml lives in, not an upstream checkout.
+    source: .
+    source-type: local
     plugin: cmake
     cmake-parameters:
       - -DCMAKE_INSTALL_PREFIX=/usr
@@ -32,7 +34,7 @@ parts:
       
     override-pull: |
       snapcraftctl pull
-      snapcraftctl set-version "$(git describe --tags | sed 's/^v//' | cut -d "-" -f1)"
+      snapcraftctl set-version "$(grep -m1 '^project' CMakeLists.txt | awk '{print $3}')"
       
     build-packages:
       - build-essential 

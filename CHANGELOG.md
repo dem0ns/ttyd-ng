@@ -24,6 +24,19 @@ pull requests that upstream never merged (see `docs/upstream-prs.md`).
 - Expire unauthenticated WebSocket connections so they cannot hold a
   `--max-clients` / `--once` slot indefinitely.
 - Update webpack and webpack-dev-server to patched versions.
+- Fix out-of-bounds reads in the initial window-title/preferences messages and
+  in `--base-path` handling (over-long input used to overrun a fixed buffer).
+- Support credentials too long for the old fixed buffer (password-manager
+  output) and stop printing the encoded credential to the log.
+- Mark the `/token` response `no-store` and `nosniff`.
+- Ignore a bare INPUT frame instead of running zero-length buffer copies.
+- A URL can no longer enable ZMODEM/trzsz/sixel, disable the leave alert or
+  set a fixed title: only presentation options are taken from the query
+  string, and client options are clamped/sanitized (no CSS injection).
+- ZMODEM downloads ask for confirmation and refuse files over 256 MiB; the
+  "remote requests a file" dialog can now be cancelled.
+- OSC 52 clipboard reads are limited to the system clipboard and can be
+  disabled with `-t disableOsc52=true`.
 
 ### Bug fixes
 
@@ -43,6 +56,29 @@ pull requests that upstream never merged (see `docs/upstream-prs.md`).
 - Mobile: keep the terminal inside the visual viewport, honor safe-area insets
   and avoid the iOS focus zoom.
 - Suppress the browser context menu while a program is tracking the mouse.
+- Split large pastes into messages below the server's 1 MiB cap.
+- Do not reset the reconnect backoff on a server that accepts and closes
+  immediately, and ignore close events from a replaced socket.
+- A `RESUME` message no longer overwrites (and leaks) a PTY chunk that is
+  still waiting to be written to the client.
+- An unauthenticated WebSocket no longer receives the configured command line
+  and client preferences before the AuthToken is accepted.
+- A client that authenticates with Basic on the handshake no longer needs the
+  AuthToken as well; failed AuthToken values are no longer written to logs.
+- `--uid` now drops privileges reliably (ttyd performs and verifies the drop
+  itself, deriving the primary gid when `-g` is omitted) instead of silently
+  continuing as root under libwebsockets 4.5.7.
+- Container images run as a non-root `ttyd` user by default.
+- Raise the HTTP header pool and shorten the half-header idle timeout, so a
+  few slow request headers cannot stall every new connection.
+- Base paths up to 255 bytes now work, and a base path must start with `/`.
+- Validate `-p`, `-m`, `-P`, `-f`, `-u` and `-g` ranges and reject trailing
+  garbage in numbers; validate `--cwd` at startup.
+- The Windows command line is built with an exact allocation instead of a
+  256-byte stack buffer.
+- Container base images are pinned, CI jobs have explicit read-only
+  permissions and do not persist the checkout token, and the snap recipe
+  builds this repository instead of upstream.
 
 ### Features
 
