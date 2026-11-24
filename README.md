@@ -9,6 +9,7 @@ ttyd-ng is a community-maintained fork of [ttyd](https://github.com/tsl0922/ttyd
 which has been effectively unmaintained since 2024. It keeps the same command
 line interface and WebSocket protocol (the binary is still called `ttyd`) and
 folds in the security fixes and bug fixes that accumulated upstream.
+See [docs/security.md](docs/security.md) for deployment guidance.
 
 ![screenshot](https://github.com/dem0ns/ttyd-ng/raw/main/screenshot.gif)
 
