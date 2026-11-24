@@ -82,7 +82,7 @@ static bool check_host_origin(struct lws *wsi) {
 #if defined(LWS_LIBRARY_VERSION_NUMBER) && LWS_LIBRARY_VERSION_NUMBER >= 5000000
   lws_parse_uri_t *uri = lws_parse_uri_create(origin);
   if (uri == NULL || uri->host == NULL) return false;
-  bool v6 = strchr(uri->host, ':') != NULL;
+  bool v6 = uri->host[0] != '[' && strchr(uri->host, ':') != NULL;
   if (uri->port == 80 || uri->port == 443) {
     snprintf(origin_host, sizeof(origin_host), v6 ? "[%s]" : "%s", uri->host);
   } else {
@@ -93,7 +93,7 @@ static bool check_host_origin(struct lws *wsi) {
   const char *prot = NULL, *address = NULL, *path = NULL;
   int port = 0;
   if (lws_parse_uri(origin, &prot, &address, &port, &path) || address == NULL) return false;
-  bool v6 = strchr(address, ':') != NULL;
+  bool v6 = address[0] != '[' && strchr(address, ':') != NULL;
   if (port == 80 || port == 443) {
     snprintf(origin_host, sizeof(origin_host), v6 ? "[%s]" : "%s", address);
   } else {

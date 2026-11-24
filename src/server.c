@@ -654,6 +654,11 @@ int main(int argc, char **argv) {
 
   lwsl_notice("ttyd %s (libwebsockets %s)\n", TTYD_VERSION, LWS_LIBRARY_VERSION);
   print_config();
+  if (server->credential == NULL && server->auth_header == NULL)
+    lwsl_notice("authentication is not configured; anyone who can reach the port can start the command\n");
+  if (server->url_arg)
+    lwsl_warn(
+        "--url-arg lets clients append command arguments; only use it with a command that tolerates that\n");
 
   // lws custom header requires lower case name, and terminating :
   if (server->auth_header != NULL) {
