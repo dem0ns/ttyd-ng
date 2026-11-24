@@ -8,12 +8,14 @@ on:
     - "CMakeLists.txt"
     - "src/*"
     - "scripts/*"
+    - "tests/*"
   pull_request:
     paths:
     - ".github/workflows/backend.yml"
     - "CMakeLists.txt"
     - "src/*"
     - "scripts/*"
+    - "tests/*"
   workflow_call:
 
 jobs:

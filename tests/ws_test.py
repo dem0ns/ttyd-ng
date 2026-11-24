@@ -216,6 +216,12 @@ def test_auth_token_flow():
         ws_frame(s, 2, b"0echo TOKEN-OK\n")
         data = ws_drain(s, 1.5)
         assert b"TOKEN-OK" in data, "unable to write after AuthToken"
+
+        # Successful auth cancels the idle timeout: still usable after 5 s.
+        time.sleep(5.5)
+        ws_frame(s, 2, b"0echo TOKEN-LATE\n")
+        data = ws_drain(s, 1.5)
+        assert b"TOKEN-LATE" in data, "authenticated connection died on the idle timeout"
         s.close()
 
         # A wrong token closes the connection.
