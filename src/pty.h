@@ -29,6 +29,7 @@ typedef void (*pty_exit_cb)(pty_process *);
 struct pty_process_ {
   int pid, exit_code, exit_signal;
   uint16_t columns, rows;
+  uint16_t xpixel, ypixel;
 #ifdef _WIN32
   STARTUPINFOEXW si;
   HPCON pty;
@@ -38,6 +39,8 @@ struct pty_process_ {
   pid_t pty;
   uv_thread_t tid;
 #endif
+  uv_timer_t *reconnect_timer;
+  int reconnect_attempts;
   char **argv;
   char **envp;
   char *cwd;

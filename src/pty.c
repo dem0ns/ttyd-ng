@@ -62,14 +62,45 @@ void pty_buf_free(pty_buf_t *buf) {
   free(buf);
 }
 
+#ifndef _WIN32
+static void pty_reconnect_out(pty_process *process);
+#endif
+
 static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
   uv_read_stop(stream);
   pty_process *process = (pty_process *) stream->data;
+  process->paused = true;
   if (n <= 0) {
-    if (n == UV_ENOBUFS || n == 0) return;
+    if (n == UV_ENOBUFS || n == 0) {
+      // n == 0 is libuv's EAGAIN: the fd polled readable but read() had nothing
+      // (a spurious wakeup on the pty master). Reading was stopped above, so we
+      // MUST restart it here — returning would leave this pty unread for the
+      // life of the connection while the websocket stays open on pings, i.e.
+      // a permanently blank terminal that only a ttyd restart clears.
+      process->paused = false;
+      uv_read_start(stream, alloc_cb, read_cb);
+      goto done;
+    }
+#ifndef _WIN32
+    // The PTY master can briefly return EIO when the slave side is revoked
+    // and reopened (e.g. login(1) calls vhangup() before re-attaching the
+    // controlling terminal).  libuv reacts to any read error by clearing
+    // UV_HANDLE_READABLE/WRITABLE on the stream and stopping its io_watcher
+    // (see uv__read() in libuv's src/unix/stream.c), so the uv_pipe_t is
+    // permanently unusable even though the underlying kernel fd recovers.
+    // Schedule a reconnect of process->out instead of tearing the session
+    // down; only EIO is treated as transient.
+    if (n == UV_EIO && process_running(process)) {
+      free(buf->base);
+      pty_reconnect_out(process);
+      return;
+    }
+#endif
+    process->reconnect_attempts = 0;
     process->read_cb(process, NULL, true);
     goto done;
   }
+  process->reconnect_attempts = 0;
   process->read_cb(process, pty_buf_init(buf->base, (size_t) n), false);
 
 done:
@@ -112,6 +143,11 @@ void process_free(pty_process *process) {
   close(process->pty);
   uv_thread_join(&process->tid);
 #endif
+  if (process->reconnect_timer != NULL) {
+    uv_timer_stop(process->reconnect_timer);
+    uv_close((uv_handle_t *) process->reconnect_timer, close_cb);
+    process->reconnect_timer = NULL;
+  }
   if (process->in != NULL) uv_close((uv_handle_t *) process->in, close_cb);
   if (process->out != NULL) uv_close((uv_handle_t *) process->out, close_cb);
   if (process->argv != NULL) free(process->argv);
@@ -124,6 +160,7 @@ void process_free(pty_process *process) {
 void pty_pause(pty_process *process) {
   if (process == NULL) return;
   if (process->paused) return;
+  process->paused = true;
   uv_read_stop((uv_stream_t *) process->out);
 }
 
@@ -131,7 +168,16 @@ void pty_resume(pty_process *process) {
   if (process == NULL) return;
   if (!process->paused) return;
   process->out->data = process;
-  uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
+  int err = uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
+  if (err) {
+#ifndef _WIN32
+    // A poisoned pty master can fail read_start too (see read_cb); keep
+    // retrying the handle instead of leaving the terminal blank forever.
+    if (err == UV_EIO || err == UV_EBADF || err == UV_EINVAL) pty_reconnect_out(process);
+#endif
+    return;
+  }
+  process->paused = false;
 }
 
 int pty_write(pty_process *process, pty_buf_t *buf) {
@@ -152,7 +198,7 @@ bool pty_resize(pty_process *process) {
   COORD size = {(int16_t) process->columns, (int16_t) process->rows};
   return pResizePseudoConsole(process->pty, size) == S_OK;
 #else
-  struct winsize size = {process->rows, process->columns, 0, 0};
+  struct winsize size = {process->rows, process->columns, process->xpixel, process->ypixel};
   return ioctl(process->pty, TIOCSWINSZ, &size) == 0;
 #endif
 }
@@ -430,7 +476,7 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   uv_disable_stdio_inheritance();
 
   int master, pid;
-  struct winsize size = {process->rows, process->columns, 0, 0};
+  struct winsize size = {process->rows, process->columns, process->xpixel, process->ypixel};
   pid = forkpty(&master, NULL, NULL, &size);
   if (pid < 0) {
     status = -errno;
@@ -476,10 +522,14 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   process->pty = master;
   process->pid = pid;
   process->paused = true;
+  process->reconnect_attempts = 0;
   process->read_cb = read_cb;
   process->exit_cb = exit_cb;
   process->async.data = process;
   uv_async_init(process->loop, &process->async, async_cb);
+  process->reconnect_timer = xmalloc(sizeof(uv_timer_t));
+  uv_timer_init(process->loop, process->reconnect_timer);
+  process->reconnect_timer->data = process;
   uv_thread_create(&process->tid, wait_cb, process);
 
   return 0;
@@ -489,5 +539,57 @@ error:
   uv_kill(pid, SIGKILL);
   waitpid(pid, NULL, 0);
   return status;
+}
+
+// Fixed-interval retry for re-arming process->out after a transient EIO on
+// the PTY master.  20 attempts at 20ms = 400ms total, which is plenty for
+// login(1) to reopen the slave side after vhangup().
+#define PTY_RECONNECT_MAX_ATTEMPTS 20
+#define PTY_RECONNECT_DELAY_MS 20
+
+static void reconnect_timer_cb(uv_timer_t *timer) {
+  pty_process *process = (pty_process *) timer->data;
+  if (process == NULL) return;
+
+  // Tear down the poisoned pipe (the underlying dup'd fd is closed by libuv).
+  if (process->out != NULL) {
+    uv_read_stop((uv_stream_t *) process->out);
+    uv_close((uv_handle_t *) process->out, close_cb);
+    process->out = NULL;
+  }
+
+  // The child may have exited while we were backing off; nothing to reconnect.
+  if (!process_running(process)) return;
+
+  // The kernel master fd (process->pty) is still valid - only libuv's wrapper
+  // got poisoned.  A fresh dup() + uv_pipe_open() gives us a working handle.
+  process->out = xmalloc(sizeof(uv_pipe_t));
+  uv_pipe_init(process->loop, process->out, 0);
+
+  if (!fd_duplicate(process->pty, process->out)) {
+    fprintf(stderr, "pty reconnect: fd_duplicate failed for pid %d\n", process->pid);
+    uv_close((uv_handle_t *) process->out, close_cb);
+    process->out = NULL;
+    return;
+  }
+
+  process->paused = true;
+  pty_resume(process);
+}
+
+static void pty_reconnect_out(pty_process *process) {
+  if (process == NULL) return;
+
+  process->reconnect_attempts++;
+  if (process->reconnect_attempts > PTY_RECONNECT_MAX_ATTEMPTS) {
+    fprintf(stderr, "pty reconnect: giving up on pid %d after %d attempts\n",
+            process->pid, PTY_RECONNECT_MAX_ATTEMPTS);
+    // Deliver EOF upstream so the websocket session closes cleanly.
+    process->read_cb(process, NULL, true);
+    return;
+  }
+
+  uint64_t delay = PTY_RECONNECT_DELAY_MS;
+  uv_timer_start(process->reconnect_timer, reconnect_timer_cb, delay, 0);
 }
 #endif

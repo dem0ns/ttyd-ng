@@ -131,7 +131,7 @@ static void print_help() {
           "    -d, --debug             Set log level (default: 7)\n"
           "    -v, --version           Print the version and exit\n"
           "    -h, --help              Print this text and exit\n\n"
-          "Visit https://github.com/tsl0922/ttyd to get more information and report bugs.\n",
+          "Visit https://github.com/dem0ns/ttyd-ng to get more information and report bugs.\n",
           TTYD_VERSION
   );
   // clang-format on
@@ -267,10 +267,12 @@ static int parse_int(char *name, char *str) {
 static int calc_command_start(int argc, char **argv) {
   // make a copy of argc and argv
   int argc_copy = argc;
-  char **argv_copy = xmalloc(sizeof(char *) * argc);
+  // keep the NULL terminator: getopt may read or permute argv[argc]
+  char **argv_copy = xmalloc(sizeof(char *) * (argc + 1));
   for (int i = 0; i < argc; i++) {
     argv_copy[i] = strdup(argv[i]);
   }
+  argv_copy[argc] = NULL;
 
   // do not print error message for invalid option
   opterr = 0;
@@ -289,7 +291,7 @@ static int calc_command_start(int argc, char **argv) {
   }
 
   // free argv copy
-  for (int i = 0; i < argc; i++) {
+  for (int i = 0; i <= argc; i++) {
     free(argv_copy[i]);
   }
   free(argv_copy);
@@ -563,6 +565,7 @@ int main(int argc, char **argv) {
 
 #if defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)
   if (ssl) {
+    server->ssl = true;
     info.ssl_cert_filepath = cert_path;
     info.ssl_private_key_filepath = key_path;
 #ifndef LWS_WITH_MBEDTLS
@@ -620,7 +623,9 @@ int main(int argc, char **argv) {
     uv_signal_start(&signals[i], signal_cb, sig_nums[i]);
   }
 
-  lws_service(context, 0);
+  // libwebsockets 5 returns from lws_service() after one event-loop turn,
+  // so drive the shared libuv loop directly; signal_cb() calls uv_stop().
+  uv_run(server->loop, UV_RUN_DEFAULT);
 
   for (int i = 0; i < sig_count; i++) {
     uv_signal_stop(&signals[i]);

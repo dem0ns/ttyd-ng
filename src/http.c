@@ -97,6 +97,13 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
   bool done = false;
 
   switch (reason) {
+    case LWS_CALLBACK_HTTP_CONFIRM_UPGRADE:
+      if (server->ssl && !lws_is_ssl(wsi)) {
+        lwsl_warn("refuse HTTP upgrade over non-SSL connection while SSL is enabled.\n");
+        return -1;
+      }
+      break;
+
     case LWS_CALLBACK_HTTP:
       access_log(wsi, (const char *)in);
       snprintf(pss->path, sizeof(pss->path), "%s", (const char *)in);
@@ -217,7 +224,8 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
       goto try_to_reuse;
 #if (defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)) && !defined(LWS_WITH_MBEDTLS)
     case LWS_CALLBACK_OPENSSL_PERFORM_CLIENT_CERT_VERIFICATION:
-      if (!len || (SSL_get_verify_result((SSL *)in) != X509_V_OK)) {
+      // len is preverify_ok; the SSL verification result is not final in this callback.
+      if (!len) {
         int err = X509_STORE_CTX_get_error((X509_STORE_CTX *)user);
         int depth = X509_STORE_CTX_get_error_depth((X509_STORE_CTX *)user);
         const char *msg = X509_verify_cert_error_string(err);

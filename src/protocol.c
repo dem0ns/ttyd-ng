@@ -14,6 +14,12 @@
 // initial message list
 static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
 
+// VULN-1 (security audit): websocket messages are accumulated fragment by
+// fragment; without a cap a client can grow the buffer without bound and
+// exhaust server memory. 1 MiB comfortably covers legitimate INPUT messages
+// (large pastes) while bounding per-connection memory.
+#define MAX_WS_MESSAGE_LEN (1024 * 1024)
+
 static int send_initial_message(struct lws *wsi, int index) {
   unsigned char message[LWS_PRE + 1 + 4096];
   unsigned char *p = &message[LWS_PRE];
@@ -36,15 +42,20 @@ static int send_initial_message(struct lws *wsi, int index) {
   return lws_write(wsi, p, (size_t)n, LWS_WRITE_BINARY);
 }
 
-static json_object *parse_window_size(const char *buf, size_t len, uint16_t *cols, uint16_t *rows) {
+static json_object *parse_window_size(const char *buf, size_t len, uint16_t *cols, uint16_t *rows,
+                                       uint16_t *xpixel, uint16_t *ypixel) {
   json_tokener *tok = json_tokener_new();
   json_object *obj = json_tokener_parse_ex(tok, buf, len);
-  struct json_object *o = NULL;
+  json_tokener_free(tok);
 
+  if (obj == NULL) return NULL;
+
+  struct json_object *o = NULL;
   if (json_object_object_get_ex(obj, "columns", &o)) *cols = (uint16_t)json_object_get_int(o);
   if (json_object_object_get_ex(obj, "rows", &o)) *rows = (uint16_t)json_object_get_int(o);
+  if (json_object_object_get_ex(obj, "xpixel", &o)) *xpixel = (uint16_t)json_object_get_int(o);
+  if (json_object_object_get_ex(obj, "ypixel", &o)) *ypixel = (uint16_t)json_object_get_int(o);
 
-  json_tokener_free(tok);
   return obj;
 }
 
@@ -54,6 +65,16 @@ static bool check_host_origin(struct lws *wsi) {
   int len = lws_hdr_copy(wsi, buf, (int)sizeof(buf), WSI_TOKEN_ORIGIN);
   if (len <= 0) return false;
 
+#if defined(LWS_LIBRARY_VERSION_NUMBER) && LWS_LIBRARY_VERSION_NUMBER >= 5000000
+  lws_parse_uri_t *uri = lws_parse_uri_create(buf);
+  if (uri == NULL) return false;
+  if (uri->port == 80 || uri->port == 443) {
+    snprintf(buf, sizeof(buf), "%s", uri->host);
+  } else {
+    snprintf(buf, sizeof(buf), "%s:%u", uri->host, (unsigned)uri->port);
+  }
+  lws_parse_uri_destroy(&uri);
+#else
   const char *prot, *address, *path;
   int port;
   if (lws_parse_uri(buf, &prot, &address, &port, &path)) return false;
@@ -62,10 +83,18 @@ static bool check_host_origin(struct lws *wsi) {
   } else {
     snprintf(buf, sizeof(buf), "%s:%d", address, port);
   }
+#endif
 
   char host_buf[256];
   memset(host_buf, 0, sizeof(host_buf));
   len = lws_hdr_copy(wsi, host_buf, (int)sizeof(host_buf), WSI_TOKEN_HOST);
+
+#if defined(LWS_ROLE_H2)
+  // Upstream issue tsl0922/ttyd#1566: HTTP/2 has no Host header (RFC 9113
+  // carries the authority in the :authority pseudo-header), so the check
+  // can never pass for ws-over-h2; fall back to :authority.
+  if (len <= 0) len = lws_hdr_copy(wsi, host_buf, (int)sizeof(host_buf), WSI_TOKEN_HTTP_COLON_AUTHORITY);
+#endif
 
   return len > 0 && strcasecmp(buf, host_buf) == 0;
 }
@@ -151,11 +180,14 @@ static char **build_env(struct pss_tty *pss) {
   return envp;
 }
 
-static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) {
+static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows,
+                          uint16_t xpixel, uint16_t ypixel) {
   pty_process *process = process_init((void *)pty_ctx_init(pss), server->loop, build_args(pss), build_env(pss));
   if (server->cwd != NULL) process->cwd = strdup(server->cwd);
   if (columns > 0) process->columns = columns;
   if (rows > 0) process->rows = rows;
+  if (xpixel > 0) process->xpixel = xpixel;
+  if (ypixel > 0) process->ypixel = ypixel;
   if (pty_spawn(process, process_read_cb, process_exit_cb) != 0) {
     lwsl_err("pty_spawn: %d (%s)\n", errno, strerror(errno));
     process_free(process);
@@ -191,8 +223,13 @@ static bool check_auth(struct lws *wsi, struct pss_tty *pss) {
 
   if (server->credential != NULL) {
     char buf[256];
-    size_t n = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_AUTHORIZATION);
-    return n >= 7 && strstr(buf, "Basic ") && !strcmp(buf + 6, server->credential);
+    int n = lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_HTTP_AUTHORIZATION);
+    // Browsers are not required to send cached Basic credentials on the
+    // WebSocket handshake (Safari does not), so an absent header falls through
+    // to the AuthToken flow: the connection is unusable for anything except
+    // JSON_DATA until the token from /token is validated.
+    if (n < 7) return true;
+    return strncmp(buf, "Basic ", 6) == 0 && !strcmp(buf + 6, server->credential);
   }
 
   return true;
@@ -215,11 +252,11 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       }
       if (!check_auth(wsi, pss)) return 1;
 
-      n = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_GET_URI);
+      int path_len = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_GET_URI);
 #if defined(LWS_ROLE_H2)
-      if (n <= 0) n = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_HTTP_COLON_PATH);
+      if (path_len <= 0) path_len = lws_hdr_copy(wsi, pss->path, sizeof(pss->path), WSI_TOKEN_HTTP_COLON_PATH);
 #endif
-      if (strncmp(pss->path, endpoints.ws, n) != 0) {
+      if (path_len <= 0 || strcmp(pss->path, endpoints.ws) != 0) {
         lwsl_warn("refuse to serve WS client for illegal ws path: %s\n", pss->path);
         return 1;
       }
@@ -285,15 +322,38 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       break;
 
     case LWS_CALLBACK_RECEIVE:
-      if (pss->buffer == NULL) {
-        pss->buffer = xmalloc(len);
-        pss->len = len;
-        memcpy(pss->buffer, in, len);
+      // Zero-length fragments carry no data. The command byte has to come from
+      // a non-empty fragment: xmalloc(0) returns NULL and dereferencing it
+      // would crash the whole process. An empty final fragment still completes
+      // a message that was accumulated from earlier fragments.
+      if (len == 0) {
+        if (pss->buffer == NULL) return 0;
+        if (lws_remaining_packet_payload(wsi) > 0 || !lws_is_final_fragment(wsi)) return 0;
       } else {
-        pss->buffer = xrealloc(pss->buffer, pss->len + len);
-        memcpy(pss->buffer + pss->len, in, len);
-        pss->len += len;
+        // Bound the accumulated message size; close with "message too big"
+        // instead of letting the buffer grow without limit.
+        if (len > MAX_WS_MESSAGE_LEN || (pss->buffer != NULL && pss->len + len > MAX_WS_MESSAGE_LEN)) {
+          lwsl_warn("WS message too large (max %d bytes), closing connection\n", MAX_WS_MESSAGE_LEN);
+          if (pss->buffer != NULL) {
+            free(pss->buffer);
+            pss->buffer = NULL;
+            pss->len = 0;
+          }
+          lws_close_reason(wsi, LWS_CLOSE_STATUS_MESSAGE_TOO_LARGE, NULL, 0);
+          return -1;
+        }
+        if (pss->buffer == NULL) {
+          pss->buffer = xmalloc(len);
+          pss->len = len;
+          memcpy(pss->buffer, in, len);
+        } else {
+          pss->buffer = xrealloc(pss->buffer, pss->len + len);
+          memcpy(pss->buffer + pss->len, in, len);
+          pss->len += len;
+        }
       }
+
+      if (pss->buffer == NULL) return 0;
 
       const char command = pss->buffer[0];
 
@@ -320,7 +380,8 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
         case RESIZE_TERMINAL:
           if (pss->process == NULL) break;
           json_object_put(
-              parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
+              parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows,
+                                &pss->process->xpixel, &pss->process->ypixel));
           pty_resize(pss->process);
           break;
         case PAUSE:
@@ -333,7 +394,10 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
           if (pss->process != NULL) break;
           uint16_t columns = 0;
           uint16_t rows = 0;
-          json_object *obj = parse_window_size(pss->buffer, pss->len, &columns, &rows);
+          uint16_t xpixel = 0;
+          uint16_t ypixel = 0;
+          json_object *obj = parse_window_size(pss->buffer, pss->len, &columns, &rows, &xpixel, &ypixel);
+          if (obj == NULL) break;
           if (server->credential != NULL) {
             struct json_object *o = NULL;
             if (json_object_object_get_ex(obj, "AuthToken", &o)) {
@@ -350,7 +414,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
             }
           }
           json_object_put(obj);
-          if (!spawn_process(pss, columns, rows)) return 1;
+          if (!spawn_process(pss, columns, rows, xpixel, ypixel)) return 1;
           break;
         default:
           lwsl_warn("ignored unknown message type: %c\n", command);
@@ -373,6 +437,7 @@ int callback_tty(struct lws *wsi, enum lws_callback_reasons reason, void *user, 
       for (int i = 0; i < pss->argc; i++) {
         free(pss->args[i]);
       }
+      free(pss->args);
 
       if (pss->process != NULL) {
         ((pty_ctx_t *)pss->process->ctx)->ws_closed = true;
