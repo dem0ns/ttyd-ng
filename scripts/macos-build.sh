@@ -10,7 +10,7 @@
 # no static libSystem.
 #
 # Build on a Mac of the matching architecture (the CI matrix does this: arm64 on
-# macos-14, x86_64 on macos-13). Single-arch native build; cross-arch from one
+# macos-26, x86_64 on macos-26-intel). Single-arch native build; cross-arch from one
 # host is not supported (dependency configure steps run native test binaries).
 #
 # Example:
