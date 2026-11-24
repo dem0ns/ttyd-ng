@@ -155,6 +155,7 @@ export class ZmodemAddon implements ITerminalAddon {
     @bind
     private receiveFile() {
         const { session, writeProgress } = this;
+        let totalAccepted = 0;
 
         session.on('offer', offer => {
             offer.on('input', () => writeProgress(offer));
@@ -163,11 +164,13 @@ export class ZmodemAddon implements ITerminalAddon {
             // The offer is fully buffered in memory and saved without any
             // earlier prompt; cap it and ask before accepting.
             const maxSize = 256 * 1024 * 1024;
-            if (!Number.isFinite(size) || size > maxSize) {
+            const maxTotal = 512 * 1024 * 1024;
+            if (!Number.isFinite(size) || size > maxSize || totalAccepted + size > maxTotal) {
                 console.warn(`[ttyd] refusing oversized ZMODEM offer: ${details.name} (${size} bytes)`);
                 offer.skip();
                 return;
             }
+            totalAccepted += size;
             const accepted = window.confirm(`Accept file "${details.name}" (${this.bytesHuman(size, 2)})?`);
             if (!accepted) {
                 offer.skip();
