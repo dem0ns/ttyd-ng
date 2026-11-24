@@ -22,9 +22,9 @@ how you deploy it matters more than any single option.
 - When using `--interface /path/x.sock`, keep the socket in a root-owned
   directory. libwebsockets 4.5.7 creates it and then chowns it by path while
   ttyd is still privileged.
-- Prefer a build linked against libwebsockets 5.x if you use `--uid`/`--gid`:
-  ttyd performs and verifies the drop itself, but older libwebsockets also
-  tries to drop privileges internally and had bugs in that path.
+- Prefer a build linked against libwebsockets 5.x when using a UNIX socket:
+  ttyd performs and verifies the `--uid`/`--gid` drop itself, but 4.5.7 does
+  the socket chown/chmod by path while still privileged.
 - The container images run as a non-root `ttyd` user. Do not add `--user root`
   unless you need it, and publish the port on loopback unless remote access is
   intended.
