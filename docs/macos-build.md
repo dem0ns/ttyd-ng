@@ -33,7 +33,7 @@ standalone gist linked from the issue tracker.)
 ## Build
 
 Build on a Mac of the architecture you are targeting (the project's CI builds
-arm64 on `macos-14` and x86_64 on `macos-13`). From a clone of this repository:
+arm64 on `macos-26` and x86_64 on `macos-26-intel`). From a clone of this repository:
 
 ```bash
 # arm64 (Apple Silicon)
