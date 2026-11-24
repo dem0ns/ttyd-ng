@@ -5,11 +5,13 @@ on:
   push:
     paths:
     - ".github/workflows/frontend.yml"
-    - "html/*"
+    - "html/**"
+    - "src/html.h"
   pull_request:
     paths:
     - ".github/workflows/frontend.yml"
-    - "html/*"
+    - "html/**"
+    - "src/html.h"
 
 jobs:
   build:

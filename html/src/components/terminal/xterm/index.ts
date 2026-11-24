@@ -305,8 +305,17 @@ export class Xterm {
         });
     }
 
+    // xterm sizes the .xterm-screen element to the character grid, so its CSS
+    // size is the terminal's pixel size. Programs read it through TIOCGWINSZ
+    // (sixel images inside tmux depend on it).
+    private getPixelSize(): { xpixel: number; ypixel: number } {
+        const screen = this.terminal?.element?.querySelector('.xterm-screen') as HTMLElement | null;
+        if (!screen) return { xpixel: 0, ypixel: 0 };
+        return { xpixel: Math.round(screen.offsetWidth), ypixel: Math.round(screen.offsetHeight) };
+    }
+
     // A newly loaded renderer may measure character cells differently; fit
-    // once after it has drawn, otherwise the terminal keeps the old column
+    // once after it has drawn, otherwise the terminal keeps its old column
     // count until the window happens to be resized.
     @bind
     private fitOnNextRender() {
@@ -331,7 +340,8 @@ export class Xterm {
         register(terminal.onBinary(data => sendData(Uint8Array.from(data, v => v.charCodeAt(0)))));
         register(
             terminal.onResize(({ cols, rows }) => {
-                const msg = JSON.stringify({ columns: cols, rows: rows });
+                const { xpixel, ypixel } = this.getPixelSize();
+                const msg = JSON.stringify({ columns: cols, rows: rows, xpixel, ypixel });
                 this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
                 if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
             })
@@ -448,7 +458,14 @@ export class Xterm {
         console.log('[ttyd] websocket connection opened');
 
         const { textEncoder, terminal, overlayAddon } = this;
-        const msg = JSON.stringify({ AuthToken: this.token, columns: terminal.cols, rows: terminal.rows });
+        const { xpixel, ypixel } = this.getPixelSize();
+        const msg = JSON.stringify({
+            AuthToken: this.token,
+            columns: terminal.cols,
+            rows: terminal.rows,
+            xpixel,
+            ypixel,
+        });
         this.socket?.send(textEncoder.encode(msg));
 
         if (this.opened) {
