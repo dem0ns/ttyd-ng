@@ -53,7 +53,8 @@ that upstream never merged:
     changes (#1530, #1595) and parse float client options correctly.
   - Reconnect with exponential backoff after network drops and sleep/wake (#1536).
   - OSC 52 clipboard writes work for all selection types and without a user
-    gesture (#1518, #1565).
+    gesture (#1518, #1565). As in other terminal emulators, this means a program
+    running in the terminal can set the system clipboard.
   - Update xterm.js to 6.0.
   - Mobile: keep the terminal inside the visual viewport, honor safe-area insets
     and avoid the iOS focus zoom (#1531, #1597).

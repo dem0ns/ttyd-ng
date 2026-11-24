@@ -37,7 +37,8 @@ pull requests that upstream never merged (see `docs/upstream-prs.md`).
 - Reconnect with exponential backoff after network drops and sleep/wake; a
   normal close or a policy rejection still waits for the user.
 - OSC 52 clipboard writes work for all selection types and without a user
-  gesture (`execCommand` fallback).
+  gesture (`execCommand` fallback). As in other terminals, programs in the
+  session can set the clipboard this way.
 - Update xterm.js to 6.0.
 - Mobile: keep the terminal inside the visual viewport, honor safe-area insets
   and avoid the iOS focus zoom.
