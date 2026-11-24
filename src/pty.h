@@ -38,6 +38,8 @@ struct pty_process_ {
 #else
   pid_t pty;
   uv_thread_t tid;
+  bool pty_valid;
+  bool thread_started;
 #endif
   uv_timer_t *reconnect_timer;
   int reconnect_attempts;

@@ -288,6 +288,129 @@ def test_malformed_json_does_not_crash():
         s2.close()
 
 
+def test_long_command_does_not_overflow():
+    """The initial window-title message used to over-read a fixed buffer."""
+    with Server("-W", "bash", "-c", "true", "A" * 8000) as srv:
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s)
+        data = ws_drain(s, 1.5)
+        assert len(data) > 5000, f"title message truncated: {len(data)} bytes"
+        assert srv.alive(), "server died on a long command line"
+        s.close()
+
+
+def test_empty_input_is_ignored():
+    """A bare INPUT command byte is not a valid empty paste."""
+    with Server("-W", "bash") as srv:
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s)
+        ws_drain(s, 0.8)
+        ws_frame(s, 2, b"0")
+        time.sleep(0.3)
+        assert srv.alive(), "server died on a bare INPUT message"
+        ws_frame(s, 2, b"0echo AFTER-EMPTY\n")
+        data = ws_drain(s, 1.5)
+        assert b"AFTER-EMPTY" in data, "terminal unusable after an empty INPUT"
+        s.close()
+
+
+def test_long_credential():
+    """Long credentials must not be truncated or overflow a fixed buffer."""
+    cred = "u" * 300 + ":p"
+    token = base64.b64encode(cred.encode()).decode()
+    with Server("-W", "-c", cred, "bash") as srv:
+        status, headers, body = http_get(srv.port, "/token", {"Authorization": f"Basic {token}"})
+        assert "200" in status, status
+        assert json.loads(body.decode())["token"] == token
+        assert headers.get("cache-control") == "no-store"
+
+        s, first = ws_connect(srv.port, authorization=f"Basic {token}")
+        assert "101" in first, first
+        spawn_terminal(s, auth_token=token)
+        data = ws_drain(s, 1.5)
+        assert len(data) > 0, "no initial messages with a long credential"
+        s.close()
+
+
+def test_long_base_path_is_rejected():
+    """A base path that does not fit is refused, not silently over-read."""
+    port = free_port()
+    proc = subprocess.run(
+        [TTYD, "-p", str(port), "-b", "/" + "a" * 300, "bash"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    )
+    assert proc.returncode != 0, "ttyd accepted an over-long base path"
+    assert b"base path is too long" in proc.stdout, proc.stdout[:200]
+
+
+def test_basic_auth_only_client():
+    """A client that authenticates with Basic need not send AuthToken too."""
+    token = base64.b64encode(b"user:pass").decode()
+    with Server("-W", "-c", "user:pass", "bash") as srv:
+        s, first = ws_connect(srv.port, authorization=f"Basic {token}")
+        assert "101" in first, first
+        spawn_terminal(s)  # no AuthToken
+        data = ws_drain(s, 1.5)
+        assert len(data) > 0, "no initial messages for a Basic-authenticated client"
+        ws_frame(s, 2, b"0echo BASIC-OK\n")
+        data = ws_drain(s, 1.5)
+        assert b"BASIC-OK" in data, "Basic-authenticated client cannot write"
+        s.close()
+
+
+def test_unauthenticated_client_sees_no_initial_messages():
+    """The configured command/preferences must not leak before auth."""
+    with Server("-W", "-c", "user:pass", "bash") as srv:
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s)  # no AuthToken -> rejected
+        data = b""
+        s.settimeout(3)
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                if (chunk[0] & 0x0F) == 0x8:
+                    break
+        except socket.timeout:
+            pass
+        assert b"1bash" not in data, "server leaked its command line before auth"
+        s.close()
+
+
+def test_long_base_path_works():
+    """Base paths at the new limit must still route /ws and /token."""
+    base = "/" + "a" * 200
+    with Server("-W", "-b", base, "bash") as srv:
+        status, _, _ = http_get(srv.port, base + "/token")
+        assert "200" in status, status
+        s, first = ws_connect(srv.port, path=base + "/ws")
+        assert "101" in first, first
+        spawn_terminal(s)
+        assert len(ws_drain(s, 1.0)) > 0
+        s.close()
+        s, first = ws_connect(srv.port, path="/ws")
+        assert "101" not in first, "websocket accepted outside the base path"
+        s.close()
+
+
+def test_base_path_requires_leading_slash():
+    proc = subprocess.run(
+        [TTYD, "-p", str(free_port()), "-b", "nope", "bash"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+    )
+    assert proc.returncode != 0, "ttyd accepted a base path without a leading slash"
+    assert b"must start with" in proc.stdout, proc.stdout[:200]
+
+
 def test_flood_message_capped():  # unbounded fragment accumulation
     with Server("-W", "bash") as srv:
         s, first = ws_connect(srv.port)

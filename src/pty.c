@@ -50,9 +50,12 @@ static void async_free_cb(uv_handle_t *handle) {
 
 pty_buf_t *pty_buf_init(char *base, size_t len) {
   pty_buf_t *buf = xmalloc(sizeof(pty_buf_t));
-  buf->base = xmalloc(len);
-  memcpy(buf->base, base, len);
+  buf->base = NULL;
   buf->len = len;
+  if (len > 0) {
+    buf->base = xmalloc(len);
+    memcpy(buf->base, base, len);
+  }
   return buf;
 }
 
@@ -78,7 +81,13 @@ static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
       // life of the connection while the websocket stays open on pings, i.e.
       // a permanently blank terminal that only a ttyd restart clears.
       process->paused = false;
-      uv_read_start(stream, alloc_cb, read_cb);
+      if (uv_read_start(stream, alloc_cb, read_cb) != 0) {
+        // The handle may be closing; do not pretend we are still reading.
+        process->paused = true;
+#ifndef _WIN32
+        pty_reconnect_out(process);
+#endif
+      }
       goto done;
     }
 #ifndef _WIN32
@@ -140,8 +149,9 @@ void process_free(pty_process *process) {
   if (process->pty != NULL) pClosePseudoConsole(process->pty);
   if (process->handle != NULL) CloseHandle(process->handle);
 #else
-  close(process->pty);
-  uv_thread_join(&process->tid);
+  // A failed spawn leaves these zeroed; closing fd 0 would close stdin.
+  if (process->pty_valid) close(process->pty);
+  if (process->thread_started) uv_thread_join(&process->tid);
 #endif
   if (process->reconnect_timer != NULL) {
     uv_timer_stop(process->reconnect_timer);
@@ -152,9 +162,11 @@ void process_free(pty_process *process) {
   if (process->out != NULL) uv_close((uv_handle_t *) process->out, close_cb);
   if (process->argv != NULL) free(process->argv);
   if (process->cwd != NULL) free(process->cwd);
-  char **p = process->envp;
-  for (; *p; p++) free(*p);
-  free(process->envp);
+  if (process->envp != NULL) {
+    char **p = process->envp;
+    for (; *p; p++) free(*p);
+    free(process->envp);
+  }
 }
 
 void pty_pause(pty_process *process) {
@@ -191,7 +203,13 @@ int pty_write(pty_process *process, pty_buf_t *buf) {
   uv_buf_t b = uv_buf_init(buf->base, buf->len);
   uv_write_t *req = xmalloc(sizeof(uv_write_t));
   req->data = buf;
-  return uv_write(req, (uv_stream_t *) process->in, &b, 1, write_cb);
+  int err = uv_write(req, (uv_stream_t *) process->in, &b, 1, write_cb);
+  if (err) {
+    // The completion callback is not invoked on failure.
+    free(req);
+    pty_buf_free(buf);
+  }
+  return err;
 }
 
 bool pty_resize(pty_process *process) {
@@ -252,19 +270,28 @@ static WCHAR *to_utf16(char *str) {
 
 // convert argv to cmdline for CreateProcessW
 static WCHAR *join_args(char **argv) {
-  char args[256] = {0};
-  char **ptr = argv;
-  for (; *ptr; ptr++) {
-    char *quoted = (char *) quote_arg(*ptr);
-    size_t arg_len = strlen(args) + 1;
-    size_t quoted_len = strlen(quoted);
-    if (arg_len == 1) memset(args, 0, 2);
-    if (arg_len != 1) strcat(args, " ");
-    strncat(args, quoted, quoted_len);
-    if (quoted != *ptr) free(quoted);
+  int count = 0;
+  for (char **p = argv; *p; p++) count++;
+  char **quoted = xmalloc(sizeof(char *) * (count + 1));
+  size_t len = 1;  // NUL
+  for (int i = 0; i < count; i++) {
+    quoted[i] = (char *)quote_arg(argv[i]);
+    len += strlen(quoted[i]) + 1;  // separator
   }
-  if (args[255] != '\0') args[255] = '\0';  // truncate
-  return to_utf16(args);
+  quoted[count] = NULL;
+
+  char *args = xmalloc(len);
+  args[0] = '\0';
+  for (int i = 0; i < count; i++) {
+    if (i) strcat(args, " ");
+    strcat(args, quoted[i]);
+    if (quoted[i] != argv[i]) free(quoted[i]);
+  }
+  free(quoted);
+
+  WCHAR *w = to_utf16(args);
+  free(args);
+  return w;
 }
 
 static bool conpty_setup(HPCON *hnd, COORD size, STARTUPINFOEXW *si_ex, char **in_name, char **out_name) {
@@ -437,7 +464,10 @@ static bool fd_duplicate(int fd, uv_pipe_t *pipe) {
   int fd_dup = dup(fd);
   if (fd_dup < 0) return false;
 
-  if (!fd_set_cloexec(fd_dup)) return false;
+  if (!fd_set_cloexec(fd_dup)) {
+    close(fd_dup);
+    return false;
+  }
 
   int status = uv_pipe_open(pipe, fd_dup);
   if (status) close(fd_dup);
@@ -523,6 +553,7 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   }
 
   process->pty = master;
+  process->pty_valid = true;
   process->pid = pid;
   process->paused = true;
   process->reconnect_attempts = 0;
@@ -533,7 +564,7 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   process->reconnect_timer = xmalloc(sizeof(uv_timer_t));
   uv_timer_init(process->loop, process->reconnect_timer);
   process->reconnect_timer->data = process;
-  uv_thread_create(&process->tid, wait_cb, process);
+  if (uv_thread_create(&process->tid, wait_cb, process) == 0) process->thread_started = true;
 
   return 0;
 

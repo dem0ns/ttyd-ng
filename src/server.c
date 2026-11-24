@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <json.h>
+#include <limits.h>
 #include <libwebsockets.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -13,6 +14,12 @@
 
 #include "utils.h"
 #include "compat.h"
+
+#if !defined(_WIN32)
+#include <grp.h>
+#include <pwd.h>
+#include <unistd.h>
+#endif
 
 #ifndef TTYD_VERSION
 #define TTYD_VERSION "unknown"
@@ -114,7 +121,7 @@ static void print_help() {
           "    -q, --exit-no-conn      Exit on all clients disconnection\n"
           "    -B, --browser           Open terminal with the default system browser\n"
           "    -I, --index             Custom index.html path\n"
-          "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 128)\n"
+          "    -b, --base-path         Expected base path for requests coming from a reverse proxy (eg: /mounted/here, max length: 255)\n"
 #if LWS_LIBRARY_VERSION_NUMBER >= 4000000
           "    -P, --ping-interval     Websocket ping interval(sec) (default: 5)\n"
 #endif
@@ -139,7 +146,8 @@ static void print_help() {
 
 static void print_config() {
   lwsl_notice("tty configuration:\n");
-  if (server->credential != NULL) lwsl_notice("  credential: %s\n", server->credential);
+  // Never print the (trivially reversible) encoded password into logs.
+  if (server->credential != NULL) lwsl_notice("  credential: (set)\n");
   lwsl_notice("  start command: %s\n", server->command);
   lwsl_notice("  close signal: %s (%d)\n", server->sig_name, server->sig_code);
   lwsl_notice("  terminal type: %s\n", server->terminal_type);
@@ -257,7 +265,7 @@ static int parse_int(char *name, char *str) {
   char *endptr;
   errno = 0;
   long val = strtol(str, &endptr, 0);
-  if (errno != 0 || endptr == str) {
+  if (errno != 0 || endptr == str || *endptr != '\0' || val < INT_MIN || val > INT_MAX) {
     fprintf(stderr, "ttyd: invalid value for %s: %s\n", name, str);
     exit(EXIT_FAILURE);
   }
@@ -325,7 +333,11 @@ int main(int argc, char **argv) {
   info.protocols = protocols;
   info.gid = -1;
   info.uid = -1;
-  info.max_http_header_pool = 16;
+  // A small pool lets a handful of partial request headers stall every new
+  // connection until lws times them out; keep headroom and shorten the idle
+  // timeout for a half-sent header.
+  info.max_http_header_pool = 128;
+  info.timeout_secs_ah_idle = 5;
   info.options = LWS_SERVER_OPTION_LIBUV | LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_DISABLE_IPV6;
 #ifndef LWS_WITHOUT_EXTENSIONS
   info.extensions = extensions;
@@ -340,6 +352,11 @@ int main(int argc, char **argv) {
   char cert_path[1024] = "";
   char key_path[1024] = "";
   char ca_path[1024] = "";
+  // Applied by ttyd itself after the vhost exists; libwebsockets 4.5.7 skips
+  // setuid() when only -u is given (initgroups(..., -1) fails) and ignores
+  // the error, leaving the server running as root.
+  int run_uid = -1;
+  int run_gid = -1;
 
   struct json_object *client_prefs = json_object_new_object();
 
@@ -371,6 +388,10 @@ int main(int argc, char **argv) {
         break;
       case 'm':
         server->max_clients = parse_int("max-clients", optarg);
+        if (server->max_clients < 0) {
+          fprintf(stderr, "ttyd: invalid max-clients: %s\n", optarg);
+          return -1;
+        }
         break;
       case 'o':
         server->once = true;
@@ -383,7 +404,7 @@ int main(int argc, char **argv) {
         break;
       case 'p':
         info.port = parse_int("port", optarg);
-        if (info.port < 0) {
+        if (info.port < 0 || info.port > 65535) {
           fprintf(stderr, "ttyd: invalid port: %s\n", optarg);
           return -1;
         }
@@ -396,23 +417,45 @@ int main(int argc, char **argv) {
         strncpy(socket_owner, optarg, sizeof(socket_owner) - 1);
         socket_owner[sizeof(socket_owner) - 1] = '\0';
         break;
-      case 'c':
+      case 'c': {
         if (strchr(optarg, ':') == NULL) {
           fprintf(stderr, "ttyd: invalid credential, format: username:password\n");
           return -1;
         }
-        char b64_text[256];
-        lws_b64_encode_string(optarg, strlen(optarg), b64_text, sizeof(b64_text));
-        server->credential = strdup(b64_text);
+        size_t credential_len = strlen(optarg);
+        if (credential_len > (size_t)INT_MAX - 4) {
+          fprintf(stderr, "ttyd: credential is too long\n");
+          return -1;
+        }
+        // 4 output bytes per 3 input bytes, plus the NUL terminator. A fixed
+        // buffer would truncate long credentials and leave it unterminated.
+        // lws_b64_encode_string() also wants one extra byte of slack.
+        size_t b64_size = 4 * ((credential_len + 2) / 3) + 2;
+        char *b64_text = xmalloc(b64_size);
+        if (lws_b64_encode_string(optarg, (int)credential_len, b64_text, (int)b64_size) < 0) {
+          fprintf(stderr, "ttyd: failed to encode credential\n");
+          free(b64_text);
+          return -1;
+        }
+        server->credential = b64_text;
         break;
+      }
       case 'H':
         server->auth_header = strdup(optarg);
         break;
       case 'u':
-        info.uid = parse_int("uid", optarg);
+        run_uid = parse_int("uid", optarg);
+        if (run_uid < 0) {
+          fprintf(stderr, "ttyd: invalid uid: %s\n", optarg);
+          return -1;
+        }
         break;
       case 'g':
-        info.gid = parse_int("gid", optarg);
+        run_gid = parse_int("gid", optarg);
+        if (run_gid < 0) {
+          fprintf(stderr, "ttyd: invalid gid: %s\n", optarg);
+          return -1;
+        }
         break;
       case 's': {
         int sig = get_sig(optarg);
@@ -430,8 +473,12 @@ int main(int argc, char **argv) {
       case 'I':
         if (!strncmp(optarg, "~/", 2)) {
           const char *home = getenv("HOME");
+          if (home == NULL) {
+            fprintf(stderr, "ttyd: HOME is not set, cannot expand ~/ in index path\n");
+            return -1;
+          }
           size_t index_len = strlen(home) + strlen(optarg);
-          server->index = malloc(index_len);
+          server->index = xmalloc(index_len);
           snprintf(server->index, index_len, "%s%s", home, optarg + 1);
         } else {
           server->index = strdup(optarg);
@@ -447,21 +494,39 @@ int main(int argc, char **argv) {
         }
         break;
       case 'b': {
-        char path[128];
-        strncpy(path, optarg, 128);
+        char path[256];
+        // A fixed-size strncpy does not terminate a longer path, and the old
+        // per-endpoint copy could fill the buffer without a NUL as well.
+        if (strlen(optarg) >= sizeof(path)) {
+          fprintf(stderr, "ttyd: base path is too long (max %zu bytes)\n", sizeof(path) - 1);
+          return -1;
+        }
+        snprintf(path, sizeof(path), "%s", optarg);
+        if (path[0] != '/') {
+          fprintf(stderr, "ttyd: base path must start with '/'\n");
+          return -1;
+        }
         size_t len = strlen(path);
         while (len && path[len - 1] == '/') path[--len] = 0;  // trim trailing /
         if (!len) break;
-#define sc(f)                                  \
-  strncpy(path + len, endpoints.f, 128 - len); \
-  endpoints.f = strdup(path);
-        sc(ws) sc(index) sc(token) sc(parent)
-#undef sc
+#define set_endpoint(field, suffix)                    \
+  do {                                                 \
+    const char *s_ = suffix;                           \
+    size_t n_ = len + strlen(s_) + 1;                  \
+    char *p_ = xmalloc(n_);                            \
+    snprintf(p_, n_, "%s%s", path, s_);                \
+    endpoints.field = p_;                              \
+  } while (0)
+        set_endpoint(ws, "/ws");
+        set_endpoint(index, "/");
+        set_endpoint(token, "/token");
+        set_endpoint(parent, "");
+#undef set_endpoint
       } break;
 #if LWS_LIBRARY_VERSION_NUMBER >= 4000000
       case 'P': {
         int interval = parse_int("ping-interval", optarg);
-        if (interval < 0) {
+        if (interval < 0 || interval > 3600) {
           fprintf(stderr, "ttyd: invalid ping interval: %s\n", optarg);
           return -1;
         }
@@ -471,7 +536,7 @@ int main(int argc, char **argv) {
 #endif
       case 'f': {
         int serv_buf_size = parse_int("srv-buf-size", optarg);
-        if (serv_buf_size < 0) {
+        if (serv_buf_size < 0 || serv_buf_size > 16 * 1024 * 1024) {
           fprintf(stderr, "ttyd: invalid srv-buf-size: %s\n", optarg);
           return -1;
         }
@@ -532,6 +597,14 @@ int main(int argc, char **argv) {
   if (server->command == NULL || strlen(server->command) == 0) {
     fprintf(stderr, "ttyd: missing start command\n");
     return -1;
+  }
+
+  if (server->cwd != NULL) {
+    struct stat st;
+    if (stat(server->cwd, &st) != 0 || !S_ISDIR(st.st_mode)) {
+      fprintf(stderr, "ttyd: invalid working directory: %s\n", server->cwd);
+      return -1;
+    }
   }
 
   lws_set_log_level(debug_level, NULL);
@@ -608,6 +681,45 @@ int main(int argc, char **argv) {
   }
   int port = lws_get_vhost_listen_port(vhost);
   lwsl_notice(" Listening on port: %d\n", port);
+
+#if !defined(_WIN32)
+  if (run_uid != -1 || run_gid != -1) {
+    struct passwd *pw = NULL;
+    if (run_uid != -1) {
+      pw = getpwuid((uid_t)run_uid);
+      if (pw == NULL) {
+        lwsl_err("unknown uid: %d\n", run_uid);
+        lws_context_destroy(context);
+        return 1;
+      }
+      if (run_gid == -1) run_gid = (int)pw->pw_gid;
+      // initgroups() needs root; without it the process can still switch to
+      // its own uid/gid (e.g. inside a container).
+      if (geteuid() == 0 && initgroups(pw->pw_name, (gid_t)run_gid) != 0) {
+        lwsl_err("initgroups failed for uid %d: %s\n", run_uid, strerror(errno));
+        lws_context_destroy(context);
+        return 1;
+      }
+    }
+    if (run_gid != -1 && setgid((gid_t)run_gid) != 0) {
+      lwsl_err("setgid(%d) failed: %s\n", run_gid, strerror(errno));
+      lws_context_destroy(context);
+      return 1;
+    }
+    if (run_uid != -1 && setuid((uid_t)run_uid) != 0) {
+      lwsl_err("setuid(%d) failed: %s\n", run_uid, strerror(errno));
+      lws_context_destroy(context);
+      return 1;
+    }
+    if ((run_uid != -1 && (int)geteuid() != run_uid) || (run_gid != -1 && (int)getegid() != run_gid)) {
+      lwsl_err("privilege drop failed: requested %d:%d, now %d:%d\n", run_uid, run_gid, (int)geteuid(),
+               (int)getegid());
+      lws_context_destroy(context);
+      return 1;
+    }
+    lwsl_notice("dropped privileges to uid:gid %d:%d\n", (int)geteuid(), (int)getegid());
+  }
+#endif
 
   if (browser) {
     char url[30];
