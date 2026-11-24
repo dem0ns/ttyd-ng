@@ -22,8 +22,7 @@ jobs:
       - name: Run yarn install, check and build
         run: |
           corepack enable
-          corepack prepare yarn@stable --activate
-          yarn install
+          yarn install --immutable
           yarn run check
           yarn run build
         working-directory: html
