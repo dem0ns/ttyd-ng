@@ -504,7 +504,9 @@ export class Xterm {
         // purpose; asking for Enter avoids a reconnect loop after the command
         // exits. Anything else (network drop, sleep/wake, VPN flap) is retried
         // with exponential backoff.
-        if (!this.reconnect || event.code === 1000) {
+        // 1000: the server/child finished; 1008: policy violation (bad
+        // AuthToken). Retrying neither automatically makes sense.
+        if (!this.reconnect || event.code === 1000 || event.code === 1008) {
             const { terminal } = this;
             const keyDispose = terminal.onKey(e => {
                 const event = e.domEvent;
