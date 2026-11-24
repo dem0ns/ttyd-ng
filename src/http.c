@@ -5,6 +5,7 @@
 #include "html.h"
 #include "server.h"
 #include "utils.h"
+#include "compat.h"
 
 enum { AUTH_OK, AUTH_FAIL, AUTH_ERROR };
 
@@ -38,7 +39,7 @@ static int check_auth(struct lws *wsi, struct pss_http *pss) {
     if (total >= 7) {
       char *buf = xmalloc((size_t)total + 1);
       int len = lws_hdr_copy(wsi, buf, total + 1, WSI_TOKEN_HTTP_AUTHORIZATION);
-      bool ok = len >= 7 && strncmp(buf, "Basic ", 6) == 0 && !strcmp(buf + 6, server->credential);
+      bool ok = len >= 7 && strncasecmp(buf, "Basic ", 6) == 0 && !strcmp(buf + 6, server->credential);
       free(buf);
       if (ok) return AUTH_OK;
     }

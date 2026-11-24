@@ -351,7 +351,8 @@ def test_basic_auth_only_client():
     """A client that authenticates with Basic need not send AuthToken too."""
     token = base64.b64encode(b"user:pass").decode()
     with Server("-W", "-c", "user:pass", "bash") as srv:
-        s, first = ws_connect(srv.port, authorization=f"Basic {token}")
+        # The auth scheme name is case-insensitive.
+        s, first = ws_connect(srv.port, authorization=f"basic {token}")
         assert "101" in first, first
         spawn_terminal(s)  # no AuthToken
         data = ws_drain(s, 1.5)

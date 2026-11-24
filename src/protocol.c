@@ -243,7 +243,7 @@ static int basic_credential_state(struct lws *wsi) {
   if (total < 7) return -1;
   char *buf = xmalloc((size_t)total + 1);
   int n = lws_hdr_copy(wsi, buf, total + 1, WSI_TOKEN_HTTP_AUTHORIZATION);
-  bool ok = n >= 7 && strncmp(buf, "Basic ", 6) == 0 && !strcmp(buf + 6, server->credential);
+  bool ok = n >= 7 && strncasecmp(buf, "Basic ", 6) == 0 && !strcmp(buf + 6, server->credential);
   free(buf);
   return ok ? 1 : 0;
 }
