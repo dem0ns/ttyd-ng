@@ -195,7 +195,7 @@ curl --insecure --cert client.p12[:password] -v https://localhost:7681
 # Docker and ttyd
   Docker containers are jailed environments which are more secure, this is useful for protecting the host system, you may use ttyd with docker like this:
 
-  - Sharing single docker container with multiple clients: docker run -it --rm -p 7681:7681 tsl0922/ttyd.
+  - Sharing single docker container with multiple clients: docker run -it --rm -p 7681:7681 ghcr.io/dem0ns/ttyd-ng.
   - Creating new docker container for each client: ttyd docker run -it --rm ubuntu.
 
 # Nginx reverse proxy
@@ -215,4 +215,4 @@ location ~ ^/ttyd(.*)$ {
 ```
 
 # AUTHOR
-  Shuanglei Tao \<tsl0922@gmail.com\> Visit https://github.com/tsl0922/ttyd to get more information and report bugs.
+  Shuanglei Tao \<tsl0922@gmail.com\> Visit https://github.com/dem0ns/ttyd-ng to get more information and report bugs.
