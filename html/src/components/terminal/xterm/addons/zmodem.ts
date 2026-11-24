@@ -19,7 +19,7 @@ export class ZmodemAddon implements ITerminalAddon {
     private terminal: Terminal;
     private sentry: Zmodem.Sentry;
     private session: Zmodem.Session;
-    private denier: () => void;
+    private denier?: () => void;
     private trzszFilter: TrzszFilter;
 
     constructor(private options: ZmodeOptions) {}
@@ -127,6 +127,21 @@ export class ZmodemAddon implements ITerminalAddon {
         }
     }
 
+    // Dismiss a pending ZMODEM send request: abort the transfer and give the
+    // keyboard back (the modal used to be undismissable without uploading).
+    @bind
+    public cancel() {
+        if (this.denier) {
+            try {
+                this.denier();
+            } catch (e) {
+                console.warn('[ttyd] zmodem deny failed:', e);
+            }
+            this.denier = undefined;
+        }
+        this.reset();
+    }
+
     @bind
     public sendFile(files: FileList) {
         const { session, writeProgress } = this;
@@ -143,11 +158,26 @@ export class ZmodemAddon implements ITerminalAddon {
 
         session.on('offer', offer => {
             offer.on('input', () => writeProgress(offer));
+            const details = offer.get_details();
+            const size = Number(details.size) || 0;
+            // The offer is fully buffered in memory and saved without any
+            // earlier prompt; cap it and ask before accepting.
+            const maxSize = 256 * 1024 * 1024;
+            if (!Number.isFinite(size) || size > maxSize) {
+                console.warn(`[ttyd] refusing oversized ZMODEM offer: ${details.name} (${size} bytes)`);
+                offer.skip();
+                return;
+            }
+            const accepted = window.confirm(`Accept file "${details.name}" (${this.bytesHuman(size, 2)})?`);
+            if (!accepted) {
+                offer.skip();
+                return;
+            }
             offer
                 .accept()
                 .then(payloads => {
                     const blob = new Blob(payloads, { type: 'application/octet-stream' });
-                    saveAs(blob, offer.get_details().name);
+                    saveAs(blob, details.name);
                 })
                 .catch(() => this.reset());
         });

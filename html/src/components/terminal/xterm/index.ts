@@ -51,6 +51,41 @@ export interface ClientOptions {
     trzszDragInitTimeout: number;
     unicodeVersion: string;
     closeOnDisconnect: boolean;
+    disableOsc52?: boolean;
+}
+
+// Client options a URL may override. Everything security-relevant (ZMODEM,
+// sixel, reconnect policy, leave alert, fixed title, drag-and-drop upload, ...)
+// stays under the server operator's control.
+const URL_OPTION_ALLOWLIST = new Set([
+    'fontSize',
+    'fontFamily',
+    'fontWeight',
+    'fontWeightBold',
+    'lineHeight',
+    'letterSpacing',
+    'cursorStyle',
+    'cursorBlink',
+    'cursorInactiveStyle',
+    'minimumContrastRatio',
+    'rendererType',
+    'scrollback',
+    'wordSeparator',
+    'disableResizeOverlay',
+    'theme',
+]);
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+// The DOM renderer writes fontFamily into a <style> text block; keep CSS
+// metacharacters out of it.
+function sanitizeFontFamily(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    if (value.length > 200 || /[;{}<>\\]/.test(value)) return undefined;
+    return value;
 }
 
 export interface FlowControl {
@@ -113,11 +148,16 @@ function copyWithExecCommand(text: string): boolean {
 // Browsers have a single clipboard, so accept every OSC 52 selection type
 // instead of dropping all but 'c' (tmux uses 'p' by default).
 class TtydClipboardProvider implements IClipboardProvider {
-    constructor(private overlayAddon: OverlayAddon) {}
+    constructor(
+        private overlayAddon: OverlayAddon,
+        private isDisabled: () => boolean
+    ) {}
 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    async readText(_selection: ClipboardSelectionType): Promise<string> {
-        if (!navigator.clipboard) return '';
+    async readText(selection: ClipboardSelectionType): Promise<string> {
+        // Answer clipboard-read queries for the system clipboard only. The
+        // answer is sent back to the PTY, so do not broaden this to other
+        // selections.
+        if (String(selection) !== 'c' || this.isDisabled() || !navigator.clipboard) return '';
         try {
             return await navigator.clipboard.readText();
         } catch {
@@ -126,6 +166,7 @@ class TtydClipboardProvider implements IClipboardProvider {
     }
 
     async writeText(_selection: ClipboardSelectionType, text: string): Promise<void> {
+        if (this.isDisabled()) return;
         if (!copyWithExecCommand(text)) {
             try {
                 await navigator.clipboard.writeText(text);
@@ -154,12 +195,15 @@ export class Xterm {
     private overlayAddon = new OverlayAddon();
     private clipboardAddon = new (ClipboardAddon as unknown as ClipboardAddonCtor)(
         undefined,
-        new TtydClipboardProvider(this.overlayAddon)
+        new TtydClipboardProvider(this.overlayAddon, () => this.osc52Disabled)
     );
     private webLinksAddon = new WebLinksAddon();
+    private osc52Disabled = false;
     private webglAddon?: WebglAddon;
     private canvasAddon?: CanvasAddon;
     private zmodemAddon?: ZmodemAddon;
+    private unicode11Addon?: Unicode11Addon;
+    private imageAddon?: ImageAddon;
 
     private socket?: WebSocket;
     private token: string;
@@ -168,7 +212,6 @@ export class Xterm {
     private titleFixed?: string;
     private resizeOverlay = true;
     private reconnect = true;
-    private doReconnect = true;
     private closeOnDisconnect = false;
 
     // Reconnect with exponential backoff: a laptop waking from sleep or a
@@ -177,6 +220,7 @@ export class Xterm {
     private reconnectDelay = 1000;
     private readonly reconnectMaxDelay = 30000;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private reconnectStableTimer: ReturnType<typeof setTimeout> | null = null;
     private reconnectKeyDisposable?: IDisposable;
     private visibilityHandlerInstalled = false;
     private fitPending = false;
@@ -198,6 +242,10 @@ export class Xterm {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        if (this.reconnectStableTimer !== null) {
+            clearTimeout(this.reconnectStableTimer);
+            this.reconnectStableTimer = null;
+        }
         this.reconnectKeyDisposable?.dispose();
         this.reconnectKeyDisposable = undefined;
         this.visibilityHandlerInstalled = false;
@@ -212,6 +260,11 @@ export class Xterm {
     @bind
     public sendFile(files: FileList) {
         this.zmodemAddon?.sendFile(files);
+    }
+
+    @bind
+    public cancelZmodem() {
+        this.zmodemAddon?.cancel();
     }
 
     @bind
@@ -437,16 +490,30 @@ export class Xterm {
         const { socket, textEncoder } = this;
         if (socket?.readyState !== WebSocket.OPEN) return;
 
+        // Keep each WebSocket message under the server's 1 MiB reassembly cap;
+        // a larger paste is split instead of closing the session.
+        const MAX_CHUNK = 256 * 1024;
         if (typeof data === 'string') {
-            const payload = new Uint8Array(data.length * 3 + 1);
-            payload[0] = Command.INPUT.charCodeAt(0);
-            const stats = textEncoder.encodeInto(data, payload.subarray(1));
-            socket.send(payload.subarray(0, (stats.written as number) + 1));
+            const chunkChars = Math.floor(MAX_CHUNK / 3);
+            for (let start = 0; start < data.length; start += chunkChars) {
+                let end = Math.min(data.length, start + chunkChars);
+                // Do not split a surrogate pair.
+                const last = data.charCodeAt(end - 1);
+                if (end < data.length && last >= 0xd800 && last <= 0xdbff) end++;
+                const chunk = data.slice(start, end);
+                const payload = new Uint8Array(chunk.length * 3 + 1);
+                payload[0] = Command.INPUT.charCodeAt(0);
+                const stats = textEncoder.encodeInto(chunk, payload.subarray(1));
+                socket.send(payload.subarray(0, (stats.written as number) + 1));
+            }
         } else {
-            const payload = new Uint8Array(data.length + 1);
-            payload[0] = Command.INPUT.charCodeAt(0);
-            payload.set(data, 1);
-            socket.send(payload);
+            for (let start = 0; start < data.length; start += MAX_CHUNK) {
+                const chunk = data.subarray(start, Math.min(data.length, start + MAX_CHUNK));
+                const payload = new Uint8Array(chunk.length + 1);
+                payload[0] = Command.INPUT.charCodeAt(0);
+                payload.set(chunk, 1);
+                socket.send(payload);
+            }
         }
     }
 
@@ -516,12 +583,18 @@ export class Xterm {
             this.opened = true;
         }
 
-        this.doReconnect = this.reconnect;
-        this.reconnectDelay = 1000;
         if (this.reconnectTimer !== null) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        // Reset the backoff only after the connection has been stable for a
+        // while: a server that accepts and immediately closes must back off
+        // like any other failure.
+        if (this.reconnectStableTimer !== null) clearTimeout(this.reconnectStableTimer);
+        this.reconnectStableTimer = setTimeout(() => {
+            this.reconnectStableTimer = null;
+            if (this.socket?.readyState === WebSocket.OPEN) this.reconnectDelay = 1000;
+        }, 10000);
         this.syncViewport();
         this.initListeners();
         terminal.focus();
@@ -529,7 +602,14 @@ export class Xterm {
 
     @bind
     private onSocketClose(event: CloseEvent) {
+        // A visibility-triggered reconnect can replace this.socket before the
+        // old socket's close event arrives; ignore the stale event.
+        if (this.socket !== undefined && event.target !== this.socket) return;
         console.log(`[ttyd] websocket connection closed with code: ${event.code}`);
+        if (this.reconnectStableTimer !== null) {
+            clearTimeout(this.reconnectStableTimer);
+            this.reconnectStableTimer = null;
+        }
 
         const { refreshToken, connect, overlayAddon } = this;
         overlayAddon.showOverlay('Connection Closed');
@@ -589,6 +669,14 @@ export class Xterm {
         const queryObj = Array.from(new URLSearchParams(query) as unknown as Iterable<[string, string]>);
 
         for (const [k, queryVal] of queryObj) {
+            // Never let a query string touch an object's prototype chain.
+            if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+            // A link must not be able to switch on file transfer, sixel,
+            // reconnect policy, the leave alert or a fixed title.
+            if (!URL_OPTION_ALLOWLIST.has(k)) {
+                console.warn(`[ttyd] ignoring client option from URL: ${k}`);
+                continue;
+            }
             let v = clientOptions[k];
             if (v === undefined) v = terminal.options[k];
             switch (typeof v) {
@@ -609,7 +697,12 @@ export class Xterm {
                     prefs[k] = queryVal;
                     break;
                 case 'object':
-                    prefs[k] = JSON.parse(queryVal);
+                    // A malformed theme in the URL must not abort prefs.
+                    try {
+                        prefs[k] = JSON.parse(queryVal);
+                    } catch {
+                        console.warn(`[ttyd] ignoring invalid JSON for client option: ${k}`);
+                    }
                     break;
                 default:
                     console.warn(`[ttyd] maybe unknown option: ${k}=${queryVal}, treating as string`);
@@ -653,7 +746,7 @@ export class Xterm {
     private applyPreferences(prefs: Preferences) {
         const { terminal, register } = this;
         let needsFit = false;
-        if (prefs.enableZmodem || prefs.enableTrzsz) {
+        if ((prefs.enableZmodem || prefs.enableTrzsz) && !this.zmodemAddon) {
             this.zmodemAddon = new ZmodemAddon({
                 zmodem: prefs.enableZmodem,
                 trzsz: prefs.enableTrzsz,
@@ -689,7 +782,6 @@ export class Xterm {
                     if (value) {
                         console.log('[ttyd] Reconnect disabled');
                         this.reconnect = false;
-                        this.doReconnect = false;
                     }
                     break;
                 case 'enableZmodem':
@@ -702,17 +794,21 @@ export class Xterm {
                     if (value) console.log(`[ttyd] trzsz drag init timeout: ${value}`);
                     break;
                 case 'enableSixel':
-                    if (value) {
-                        terminal.loadAddon(register(new ImageAddon()));
+                    if (value && !this.imageAddon) {
+                        this.imageAddon = new ImageAddon();
+                        terminal.loadAddon(register(this.imageAddon));
                         console.log('[ttyd] Sixel enabled');
                     }
+                    break;
+                case 'disableOsc52':
+                    this.osc52Disabled = !!value;
+                    if (value) console.log('[ttyd] OSC 52 clipboard disabled');
                     break;
                 case 'closeOnDisconnect':
                     if (value) {
                         console.log('[ttyd] close on disconnect enabled (Reconnect disabled)');
                         this.closeOnDisconnect = true;
                         this.reconnect = false;
-                        this.doReconnect = false;
                     }
                     break;
                 case 'titleFixed':
@@ -734,17 +830,43 @@ export class Xterm {
                         case '11':
                         default:
                             console.log('[ttyd] setting Unicode version: 11');
-                            terminal.loadAddon(new Unicode11Addon());
+                            if (!this.unicode11Addon) {
+                                this.unicode11Addon = new Unicode11Addon();
+                                terminal.loadAddon(register(this.unicode11Addon));
+                            }
                             terminal.unicode.activeVersion = '11';
                             break;
                     }
                     break;
-                default:
+                default: {
                     console.log(`[ttyd] option: ${key}=${JSON.stringify(value)}`);
-                    if (terminal.options[key] instanceof Object) {
-                        terminal.options[key] = Object.assign({}, terminal.options[key], value);
-                    } else {
-                        terminal.options[key] = value;
+                    let assigned: unknown = value;
+                    if (key === 'fontFamily') {
+                        assigned = sanitizeFontFamily(value);
+                        if (assigned === undefined) {
+                            console.warn('[ttyd] ignoring invalid fontFamily');
+                            break;
+                        }
+                    } else if (key === 'fontSize') {
+                        assigned = clampNumber(value, 1, 100, terminal.options.fontSize ?? 13);
+                    } else if (key === 'lineHeight') {
+                        assigned = clampNumber(value, 0.5, 4, terminal.options.lineHeight ?? 1);
+                    } else if (key === 'letterSpacing') {
+                        assigned = clampNumber(value, -10, 10, terminal.options.letterSpacing ?? 0);
+                    } else if (key === 'scrollback') {
+                        assigned = Math.round(clampNumber(value, 0, 100000, terminal.options.scrollback ?? 1000));
+                    }
+                    try {
+                        if (terminal.options[key] instanceof Object) {
+                            terminal.options[key] = Object.assign({}, terminal.options[key], assigned);
+                        } else {
+                            terminal.options[key] = assigned;
+                        }
+                    } catch (e) {
+                        // A bad value from the URL must not abort every other
+                        // preference (including the trusted server payload).
+                        console.warn(`[ttyd] ignoring invalid option ${key}:`, e);
+                        break;
                     }
                     // Anything that changes the measured cell size needs a
                     // refit; the old code only covered fontSize/fontFamily and
@@ -753,6 +875,7 @@ export class Xterm {
                         needsFit = true;
                     }
                     break;
+                }
             }
         }
         this.syncPageBackground();
