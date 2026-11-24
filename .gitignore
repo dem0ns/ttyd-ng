@@ -52,3 +52,7 @@ build
 
 # Project files
 !init.d
+
+# macOS static build artifacts
+.macos-build/
+.macos-stage/

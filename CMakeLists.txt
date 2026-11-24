@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.12.0)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-project(ttyd VERSION 1.7.7 LANGUAGES C)
+project(ttyd VERSION 2.0.0 LANGUAGES C)
 
 set(TTYD_VERSION "${PROJECT_VERSION}")
 
@@ -87,7 +87,9 @@ endif()
 
 if(WIN32)
     # libuv static requires dbghelp for MiniDumpWriteDump/Sym* APIs
-    list(APPEND LINK_LIBS shell32 ws2_32 dbghelp)
+    # libuv >= 1.53 needs synchronization (WaitOnAddress) and OpenSSL >= 4
+    # needs bcrypt (BCryptGenRandom) on Windows.
+    list(APPEND LINK_LIBS shell32 ws2_32 dbghelp synchronization bcrypt)
     if(MSVC)
         find_package(getopt CONFIG)
         if(getopt_FOUND)
