@@ -263,6 +263,31 @@ def test_unauthenticated_idle_connection_times_out():
         s.close()
 
 
+def test_malformed_json_does_not_crash():
+    """Invalid JSON in the handshake or a resize message must not kill ttyd."""
+    with Server("-W", "bash") as srv:
+        # Malformed handshake: rejected without spawning a process.
+        s, first = ws_connect(srv.port)
+        assert "101" in first, first
+        ws_frame(s, 2, b"{ not json")
+        time.sleep(0.3)
+        assert srv.alive(), "server died on a malformed handshake"
+
+        # The server still accepts new clients.
+        s2, first = ws_connect(srv.port)
+        assert "101" in first, first
+        spawn_terminal(s2)
+        ws_drain(s2, 0.8)
+        ws_frame(s2, 2, b"1not-json")  # RESIZE_TERMINAL with invalid JSON
+        time.sleep(0.3)
+        assert srv.alive(), "server died on a malformed resize message"
+        ws_frame(s2, 2, b"0echo AFTER-BAD-JSON\n")
+        data = ws_drain(s2, 1.5)
+        assert b"AFTER-BAD-JSON" in data, "terminal unusable after malformed JSON"
+        s.close()
+        s2.close()
+
+
 def test_flood_message_capped():  # unbounded fragment accumulation
     with Server("-W", "bash") as srv:
         s, first = ws_connect(srv.port)

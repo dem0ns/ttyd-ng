@@ -89,6 +89,7 @@ function copyWithExecCommand(text: string): boolean {
 
     const selection = document.getSelection();
     const savedRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    const previousFocus = document.activeElement as HTMLElement | null;
     textarea.select();
 
     let copied = false;
@@ -103,6 +104,9 @@ function copyWithExecCommand(text: string): boolean {
         selection.removeAllRanges();
         selection.addRange(savedRange);
     }
+    // Selecting the textarea moved focus away from the terminal; give it back
+    // so the user can keep typing after an OSC 52 write.
+    previousFocus?.focus?.();
     return copied;
 }
 
@@ -173,6 +177,7 @@ export class Xterm {
     private reconnectDelay = 1000;
     private readonly reconnectMaxDelay = 30000;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private reconnectKeyDisposable?: IDisposable;
     private visibilityHandlerInstalled = false;
     private fitPending = false;
     private parent?: HTMLElement;
@@ -193,6 +198,8 @@ export class Xterm {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.reconnectKeyDisposable?.dispose();
+        this.reconnectKeyDisposable = undefined;
         this.visibilityHandlerInstalled = false;
     }
 
@@ -301,7 +308,7 @@ export class Xterm {
         this.fitPending = true;
         requestAnimationFrame(() => {
             this.fitPending = false;
-            this.fitAddon.fit();
+            if (this.terminal?.element) this.fitAddon.fit();
         });
     }
 
@@ -312,6 +319,25 @@ export class Xterm {
         const screen = this.terminal?.element?.querySelector('.xterm-screen') as HTMLElement | null;
         if (!screen) return { xpixel: 0, ypixel: 0 };
         return { xpixel: Math.round(screen.offsetWidth), ypixel: Math.round(screen.offsetHeight) };
+    }
+
+    private getWindowSizeMessage(cols: number, rows: number, authToken?: string): string {
+        const { xpixel, ypixel } = this.getPixelSize();
+        const msg: { [key: string]: number | string } = {};
+        if (authToken !== undefined) msg.AuthToken = authToken;
+        msg.columns = cols;
+        msg.rows = rows;
+        // A zero would reset the PTY pixel size; omit the fields until the
+        // screen element has been laid out instead.
+        if (xpixel > 0 && ypixel > 0) {
+            msg.xpixel = xpixel;
+            msg.ypixel = ypixel;
+        }
+        return JSON.stringify(msg);
+    }
+
+    private sendWindowSize(cols: number, rows: number) {
+        this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + this.getWindowSizeMessage(cols, rows)));
     }
 
     // A newly loaded renderer may measure character cells differently; fit
@@ -340,9 +366,7 @@ export class Xterm {
         register(terminal.onBinary(data => sendData(Uint8Array.from(data, v => v.charCodeAt(0)))));
         register(
             terminal.onResize(({ cols, rows }) => {
-                const { xpixel, ypixel } = this.getPixelSize();
-                const msg = JSON.stringify({ columns: cols, rows: rows, xpixel, ypixel });
-                this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + msg));
+                this.sendWindowSize(cols, rows);
                 if (this.resizeOverlay) overlayAddon.showOverlay(`${cols}x${rows}`, 300);
             })
         );
@@ -364,13 +388,21 @@ export class Xterm {
             })
         );
         if (window.visualViewport) {
+            // Pinch-zoom changes visualViewport.height/scale; refitting on
+            // every zoom step would turn magnification into a reflow.
             register(
                 addEventListener(window.visualViewport, 'resize', () => {
+                    if (window.visualViewport!.scale !== 1) return;
                     this.syncViewport();
                     fitAddon.fit();
                 })
             );
-            register(addEventListener(window.visualViewport, 'scroll', () => this.syncViewport()));
+            register(
+                addEventListener(window.visualViewport, 'scroll', () => {
+                    if (window.visualViewport!.scale !== 1) return;
+                    this.syncViewport();
+                })
+            );
         }
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
     }
@@ -418,6 +450,13 @@ export class Xterm {
 
     @bind
     public connect() {
+        // Reconnect can be requested from the backoff timer, the visibility
+        // handler and the Enter key; only one socket may be in flight.
+        const state = this.socket?.readyState;
+        if (state === WebSocket.CONNECTING || state === WebSocket.OPEN) return;
+        this.reconnectKeyDisposable?.dispose();
+        this.reconnectKeyDisposable = undefined;
+
         this.socket = new WebSocket(this.options.wsUrl, ['tty']);
         const { socket, register } = this;
 
@@ -458,15 +497,14 @@ export class Xterm {
         console.log('[ttyd] websocket connection opened');
 
         const { textEncoder, terminal, overlayAddon } = this;
-        const { xpixel, ypixel } = this.getPixelSize();
-        const msg = JSON.stringify({
-            AuthToken: this.token,
-            columns: terminal.cols,
-            rows: terminal.rows,
-            xpixel,
-            ypixel,
-        });
-        this.socket?.send(textEncoder.encode(msg));
+        this.socket?.send(textEncoder.encode(this.getWindowSizeMessage(terminal.cols, terminal.rows, this.token)));
+        // The socket can open before the first render, when .xterm-screen has
+        // no size yet; resend the size once the grid has been laid out.
+        if (this.getPixelSize().xpixel === 0) {
+            requestAnimationFrame(() => {
+                if (this.socket?.readyState === WebSocket.OPEN) this.sendWindowSize(terminal.cols, terminal.rows);
+            });
+        }
 
         if (this.opened) {
             terminal.reset();
@@ -501,25 +539,28 @@ export class Xterm {
         }
 
         // 1000: CLOSE_NORMAL means the server or the child process finished on
-        // purpose; asking for Enter avoids a reconnect loop after the command
-        // exits. Anything else (network drop, sleep/wake, VPN flap) is retried
-        // with exponential backoff.
-        // 1000: the server/child finished; 1008: policy violation (bad
-        // AuthToken). Retrying neither automatically makes sense.
+        // purpose, and 1008 is a policy rejection (bad AuthToken). Retrying
+        // either automatically makes no sense; anything else (network drop,
+        // sleep/wake, VPN flap) is retried with exponential backoff.
         if (!this.reconnect || event.code === 1000 || event.code === 1008) {
             const { terminal } = this;
             const keyDispose = terminal.onKey(e => {
-                const event = e.domEvent;
-                if (event.key === 'Enter') {
+                if (e.domEvent.key === 'Enter') {
                     keyDispose.dispose();
+                    this.reconnectKeyDisposable = undefined;
                     overlayAddon.showOverlay('Reconnecting...');
                     refreshToken().then(connect);
                 }
             });
+            this.reconnectKeyDisposable = keyDispose;
             overlayAddon.showOverlay('Press ⏎ to Reconnect');
             return;
         }
 
+        // dispose() removed the visibility listener (it was registered while
+        // the socket was still open); re-arm it for the disconnected window so
+        // a tab switch can skip the remaining backoff.
+        this.installVisibilityHandler();
         this.scheduleReconnect();
     }
 
