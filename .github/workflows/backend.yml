@@ -101,3 +101,21 @@ jobs:
         with:
           name: ttyd.${{ matrix.asset }}
           path: build/ttyd*
+
+  linux-test:
+    name: linux test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libwebsockets-dev libuv1-dev libjson-c-dev zlib1g-dev libssl-dev python3
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: Run tests
+        run: |
+          python3 -I tests/ws_test.py ./build/ttyd
+          python3 -I tests/backend-regression.py ./build/ttyd
