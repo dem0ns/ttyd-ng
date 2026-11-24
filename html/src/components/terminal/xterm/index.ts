@@ -337,7 +337,9 @@ export class Xterm {
     }
 
     private sendWindowSize(cols: number, rows: number) {
-        this.socket?.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + this.getWindowSizeMessage(cols, rows)));
+        // A fit can run while a reconnect is still CONNECTING.
+        if (this.socket?.readyState !== WebSocket.OPEN) return;
+        this.socket.send(this.textEncoder.encode(Command.RESIZE_TERMINAL + this.getWindowSizeMessage(cols, rows)));
     }
 
     // A newly loaded renderer may measure character cells differently; fit
