@@ -115,8 +115,10 @@ static void process_read_cb(pty_process *process, pty_buf_t *buf, bool eof) {
     return;
   }
 
-  if (eof && !process_running(process))
-    ctx->pss->lws_close_status = process->exit_code == 0 ? 1000 : 1006;
+  // A live child can also lose its readable PTY (reconnect attempts
+  // exhausted); close the session instead of leaving a frozen terminal.
+  if (eof && (process->read_failed || !process_running(process)))
+    ctx->pss->lws_close_status = process->read_failed ? 1006 : (process->exit_code == 0 ? 1000 : 1006);
   else
     ctx->pss->pty_buf = buf;
   lws_callback_on_writable(ctx->pss->wsi);

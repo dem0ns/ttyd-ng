@@ -41,6 +41,7 @@ struct pty_process_ {
 #endif
   uv_timer_t *reconnect_timer;
   int reconnect_attempts;
+  bool read_failed;  // reconnect attempts exhausted while the child is alive
   char **argv;
   char **envp;
   char *cwd;

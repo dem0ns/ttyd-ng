@@ -167,6 +167,9 @@ void pty_pause(pty_process *process) {
 void pty_resume(pty_process *process) {
   if (process == NULL) return;
   if (!process->paused) return;
+  // The reconnect timer may have closed the handle and be waiting to re-open
+  // it; a RESUME in that window must not dereference NULL.
+  if (process->out == NULL) return;
   process->out->data = process;
   int err = uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
   if (err) {
@@ -570,6 +573,9 @@ static void reconnect_timer_cb(uv_timer_t *timer) {
     fprintf(stderr, "pty reconnect: fd_duplicate failed for pid %d\n", process->pid);
     uv_close((uv_handle_t *) process->out, close_cb);
     process->out = NULL;
+    // Retry until the attempt budget is exhausted, otherwise the session is
+    // left with no readable handle and no timer to recover it.
+    pty_reconnect_out(process);
     return;
   }
 
@@ -584,7 +590,9 @@ static void pty_reconnect_out(pty_process *process) {
   if (process->reconnect_attempts > PTY_RECONNECT_MAX_ATTEMPTS) {
     fprintf(stderr, "pty reconnect: giving up on pid %d after %d attempts\n",
             process->pid, PTY_RECONNECT_MAX_ATTEMPTS);
-    // Deliver EOF upstream so the websocket session closes cleanly.
+    // The child may still be alive; mark the read side failed so the protocol
+    // layer closes the websocket instead of leaving a frozen terminal.
+    process->read_failed = true;
     process->read_cb(process, NULL, true);
     return;
   }
