@@ -2,7 +2,7 @@ import { bind } from 'decko';
 import type { IDisposable, ITerminalOptions } from '@xterm/xterm';
 import { Terminal } from '@xterm/xterm';
 import { CanvasAddon } from '@xterm/addon-canvas';
-import { ClipboardAddon } from '@xterm/addon-clipboard';
+import { ClipboardAddon, type IClipboardProvider, type ClipboardSelectionType } from '@xterm/addon-clipboard';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -76,6 +76,68 @@ function addEventListener(target: EventTarget, type: string, listener: EventList
     return toDisposable(() => target.removeEventListener(type, listener));
 }
 
+// document.execCommand('copy') predates the user-activation requirement of
+// navigator.clipboard: OSC 52 writes arrive asynchronously from the PTY, well
+// outside any gesture, so the async clipboard API rejects them. Try the legacy
+// path first and let the caller fall back if it returns false.
+function copyWithExecCommand(text: string): boolean {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';
+    document.body.appendChild(textarea);
+
+    const selection = document.getSelection();
+    const savedRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    textarea.select();
+
+    let copied = false;
+    try {
+        copied = document.execCommand('copy');
+    } catch {
+        copied = false;
+    }
+
+    document.body.removeChild(textarea);
+    if (savedRange && selection) {
+        selection.removeAllRanges();
+        selection.addRange(savedRange);
+    }
+    return copied;
+}
+
+// Browsers have a single clipboard, so accept every OSC 52 selection type
+// instead of dropping all but 'c' (tmux uses 'p' by default).
+class TtydClipboardProvider implements IClipboardProvider {
+    constructor(private overlayAddon: OverlayAddon) {}
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    async readText(_selection: ClipboardSelectionType): Promise<string> {
+        if (!navigator.clipboard) return '';
+        try {
+            return await navigator.clipboard.readText();
+        } catch {
+            return '';
+        }
+    }
+
+    async writeText(_selection: ClipboardSelectionType, text: string): Promise<void> {
+        if (!copyWithExecCommand(text)) {
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (e) {
+                console.warn('[ttyd] clipboard write failed:', e);
+                return;
+            }
+        }
+        this.overlayAddon.showOverlay('✂', 200);
+    }
+}
+
+// The addon's typings declare (provider?), but the runtime constructor is
+// (base64, provider); passing undefined keeps the default base64 codec.
+type ClipboardAddonCtor = new (base64?: unknown, provider?: IClipboardProvider) => ClipboardAddon;
+
 export class Xterm {
     private disposables: IDisposable[] = [];
     private textEncoder = new TextEncoder();
@@ -86,7 +148,10 @@ export class Xterm {
     private terminal: Terminal;
     private fitAddon = new FitAddon();
     private overlayAddon = new OverlayAddon();
-    private clipboardAddon = new ClipboardAddon();
+    private clipboardAddon = new (ClipboardAddon as unknown as ClipboardAddonCtor)(
+        undefined,
+        new TtydClipboardProvider(this.overlayAddon)
+    );
     private webLinksAddon = new WebLinksAddon();
     private webglAddon?: WebglAddon;
     private canvasAddon?: CanvasAddon;
@@ -102,6 +167,16 @@ export class Xterm {
     private doReconnect = true;
     private closeOnDisconnect = false;
 
+    // Reconnect with exponential backoff: a laptop waking from sleep or a
+    // short network drop should not leave the terminal stuck until the user
+    // notices and presses Enter.
+    private reconnectDelay = 1000;
+    private readonly reconnectMaxDelay = 30000;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private visibilityHandlerInstalled = false;
+    private fitPending = false;
+    private parent?: HTMLElement;
+
     private writeFunc = (data: ArrayBuffer) => this.writeData(new Uint8Array(data));
 
     constructor(
@@ -114,6 +189,11 @@ export class Xterm {
             d.dispose();
         }
         this.disposables.length = 0;
+        if (this.reconnectTimer !== null) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.visibilityHandlerInstalled = false;
     }
 
     @bind
@@ -153,6 +233,7 @@ export class Xterm {
 
     @bind
     public open(parent: HTMLElement) {
+        this.parent = parent;
         this.terminal = new Terminal(this.options.termOptions);
         const { terminal, fitAddon, overlayAddon, clipboardAddon, webLinksAddon } = this;
         window.term = terminal as TtydTerminal;
@@ -166,7 +247,74 @@ export class Xterm {
         terminal.loadAddon(webLinksAddon);
 
         terminal.open(parent);
+        this.syncPageBackground();
+        this.syncViewport();
         fitAddon.fit();
+
+        // Suppress the browser context menu while the program is handling
+        // mouse events (tmux, vim, ...); Shift+right-click keeps the native
+        // menu available.
+        terminal.element?.addEventListener(
+            'contextmenu',
+            e => {
+                if (e.shiftKey) return;
+                if (terminal.modes.mouseTrackingMode !== 'none') {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                }
+            },
+            { capture: true }
+        );
+    }
+
+    @bind
+    private syncPageBackground() {
+        const themeBackground = this.terminal?.options.theme?.background;
+        const color = typeof themeBackground === 'string' && themeBackground !== '' ? themeBackground : '#2b2b2b';
+        document.documentElement.style.backgroundColor = color;
+        document.body.style.backgroundColor = color;
+    }
+
+    // Keep the terminal exactly inside the visual viewport: on mobile the
+    // layout viewport does not shrink when the on-screen keyboard opens, so
+    // without this the bottom of the terminal (and the cursor) scrolls out of
+    // view.
+    @bind
+    private syncViewport() {
+        if (!this.parent) return;
+        const viewport = window.visualViewport;
+        if (viewport) {
+            this.parent.style.height = `${Math.round(viewport.height)}px`;
+            this.parent.style.top = `${Math.max(0, Math.round(viewport.offsetTop))}px`;
+        } else {
+            this.parent.style.height = '';
+            this.parent.style.top = '';
+        }
+    }
+
+    // Coalesce fits requested from renderer/font changes into one animation
+    // frame; fitting synchronously right after changing renderer options
+    // measures stale cell metrics.
+    @bind
+    private scheduleFit() {
+        if (this.fitPending) return;
+        this.fitPending = true;
+        requestAnimationFrame(() => {
+            this.fitPending = false;
+            this.fitAddon.fit();
+        });
+    }
+
+    // A newly loaded renderer may measure character cells differently; fit
+    // once after it has drawn, otherwise the terminal keeps the old column
+    // count until the window happens to be resized.
+    @bind
+    private fitOnNextRender() {
+        if (!this.terminal) return;
+        const disposable = this.terminal.onRender(() => {
+            disposable.dispose();
+            this.scheduleFit();
+        });
     }
 
     @bind
@@ -199,7 +347,21 @@ export class Xterm {
                 this.overlayAddon?.showOverlay('\u2702', 200);
             })
         );
-        register(addEventListener(window, 'resize', () => fitAddon.fit()));
+        register(
+            addEventListener(window, 'resize', () => {
+                this.syncViewport();
+                fitAddon.fit();
+            })
+        );
+        if (window.visualViewport) {
+            register(
+                addEventListener(window.visualViewport, 'resize', () => {
+                    this.syncViewport();
+                    fitAddon.fit();
+                })
+            );
+            register(addEventListener(window.visualViewport, 'scroll', () => this.syncViewport()));
+        }
         register(addEventListener(window, 'beforeunload', this.onWindowUnload));
     }
 
@@ -253,7 +415,32 @@ export class Xterm {
         register(addEventListener(socket, 'open', this.onSocketOpen));
         register(addEventListener(socket, 'message', this.onSocketData as EventListener));
         register(addEventListener(socket, 'close', this.onSocketClose as EventListener));
-        register(addEventListener(socket, 'error', () => (this.doReconnect = false)));
+        // Do not give up on reconnect here: the browser always fires `close`
+        // after `error`, and onSocketClose schedules a backoff retry.
+        register(addEventListener(socket, 'error', () => console.log('[ttyd] websocket error (will retry on close)')));
+        this.installVisibilityHandler();
+    }
+
+    @bind
+    private installVisibilityHandler() {
+        if (this.visibilityHandlerInstalled) return;
+        this.visibilityHandlerInstalled = true;
+        const { register } = this;
+        register(
+            addEventListener(document, 'visibilitychange', () => {
+                if (document.visibilityState !== 'visible') return;
+                const state = this.socket?.readyState;
+                const socketDown = state === undefined || state === WebSocket.CLOSED || state === WebSocket.CLOSING;
+                if (!socketDown || !this.reconnect) return;
+                console.log('[ttyd] tab visible again, reconnecting immediately');
+                if (this.reconnectTimer !== null) {
+                    clearTimeout(this.reconnectTimer);
+                    this.reconnectTimer = null;
+                }
+                this.reconnectDelay = 1000;
+                this.refreshToken().then(this.connect);
+            })
+        );
     }
 
     @bind
@@ -273,6 +460,12 @@ export class Xterm {
         }
 
         this.doReconnect = this.reconnect;
+        this.reconnectDelay = 1000;
+        if (this.reconnectTimer !== null) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.syncViewport();
         this.initListeners();
         terminal.focus();
     }
@@ -281,17 +474,20 @@ export class Xterm {
     private onSocketClose(event: CloseEvent) {
         console.log(`[ttyd] websocket connection closed with code: ${event.code}`);
 
-        const { refreshToken, connect, doReconnect, overlayAddon } = this;
+        const { refreshToken, connect, overlayAddon } = this;
         overlayAddon.showOverlay('Connection Closed');
         this.dispose();
 
-        // 1000: CLOSE_NORMAL
-        if (event.code !== 1000 && doReconnect) {
-            overlayAddon.showOverlay('Reconnecting...');
-            refreshToken().then(connect);
-        } else if (this.closeOnDisconnect) {
+        if (this.closeOnDisconnect) {
             window.close();
-        } else {
+            return;
+        }
+
+        // 1000: CLOSE_NORMAL means the server or the child process finished on
+        // purpose; asking for Enter avoids a reconnect loop after the command
+        // exits. Anything else (network drop, sleep/wake, VPN flap) is retried
+        // with exponential backoff.
+        if (!this.reconnect || event.code === 1000) {
             const { terminal } = this;
             const keyDispose = terminal.onKey(e => {
                 const event = e.domEvent;
@@ -302,7 +498,25 @@ export class Xterm {
                 }
             });
             overlayAddon.showOverlay('Press ⏎ to Reconnect');
+            return;
         }
+
+        this.scheduleReconnect();
+    }
+
+    @bind
+    private scheduleReconnect() {
+        if (this.reconnectTimer !== null) return;
+        const delay = this.reconnectDelay;
+        const seconds = Math.round(delay / 100) / 10;
+        this.overlayAddon.showOverlay(`Reconnecting in ${seconds}s...`, Math.min(delay, 2000));
+        console.log(`[ttyd] scheduling reconnect in ${delay}ms`);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.reconnectMaxDelay);
+            this.overlayAddon.showOverlay('Reconnecting...');
+            this.refreshToken().then(this.connect);
+        }, delay);
     }
 
     @bind
@@ -319,7 +533,13 @@ export class Xterm {
                 case 'boolean':
                     prefs[k] = queryVal === 'true' || queryVal === '1';
                     break;
-                case 'number':
+                case 'number': {
+                    // lineHeight, letterSpacing, ... are floats; parseInt
+                    // silently turned 1.5 into 1.
+                    const parsed = Number.parseFloat(queryVal);
+                    prefs[k] = Number.isNaN(parsed) ? queryVal : parsed;
+                    break;
+                }
                 case 'bigint':
                     prefs[k] = Number.parseInt(queryVal, 10);
                     break;
@@ -369,7 +589,8 @@ export class Xterm {
 
     @bind
     private applyPreferences(prefs: Preferences) {
-        const { terminal, fitAddon, register } = this;
+        const { terminal, register } = this;
+        let needsFit = false;
         if (prefs.enableZmodem || prefs.enableTrzsz) {
             this.zmodemAddon = new ZmodemAddon({
                 zmodem: prefs.enableZmodem,
@@ -388,6 +609,7 @@ export class Xterm {
             switch (key) {
                 case 'rendererType':
                     this.setRendererType(value);
+                    needsFit = true;
                     break;
                 case 'disableLeaveAlert':
                     if (value) {
@@ -432,7 +654,7 @@ export class Xterm {
                     }
                     break;
                 case 'titleFixed':
-                    if (!value || value === '') return;
+                    if (!value || value === '') break;
                     console.log(`[ttyd] setting fixed title: ${value}`);
                     this.titleFixed = value;
                     document.title = value;
@@ -462,10 +684,17 @@ export class Xterm {
                     } else {
                         terminal.options[key] = value;
                     }
-                    if (key.indexOf('font') === 0) fitAddon.fit();
+                    // Anything that changes the measured cell size needs a
+                    // refit; the old code only covered fontSize/fontFamily and
+                    // ran before the renderer had applied the new metrics.
+                    if (key.indexOf('font') === 0 || key === 'lineHeight' || key === 'letterSpacing') {
+                        needsFit = true;
+                    }
                     break;
             }
         }
+        this.syncPageBackground();
+        if (needsFit) this.scheduleFit();
     }
 
     @bind
@@ -494,6 +723,7 @@ export class Xterm {
             try {
                 this.terminal.loadAddon(this.canvasAddon);
                 console.log('[ttyd] canvas renderer loaded');
+                this.fitOnNextRender();
             } catch (e) {
                 console.log('[ttyd] canvas renderer could not be loaded, falling back to dom renderer', e);
                 disposeCanvasRenderer();
@@ -509,6 +739,7 @@ export class Xterm {
                 });
                 terminal.loadAddon(this.webglAddon);
                 console.log('[ttyd] WebGL renderer loaded');
+                this.fitOnNextRender();
             } catch (e) {
                 console.log('[ttyd] WebGL renderer could not be loaded, falling back to canvas renderer', e);
                 disposeWebglRenderer();

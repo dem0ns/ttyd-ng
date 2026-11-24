@@ -4,15 +4,53 @@ body {
   min-height: 100%;
   margin: 0;
   overflow: hidden;
+  overscroll-behavior: none;
+  background-color: #2b2b2b;
+  position: fixed;
+  inset: 0;
+  width: 100%;
 }
 
 #terminal-container {
-  width: auto;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
   height: 100%;
-  margin: 0 auto;
+  margin: 0;
   padding: 0;
+  overflow: hidden;
   .terminal {
-    padding: 5px;
-    height: calc(100% - 10px);
+    box-sizing: border-box;
+    height: 100%;
+    // keep the terminal content clear of the notch / home indicator when the
+    // page is rendered edge-to-edge (viewport-fit=cover)
+    padding: calc(5px + env(safe-area-inset-top)) calc(5px + env(safe-area-inset-right))
+      calc(5px + env(safe-area-inset-bottom)) calc(5px + env(safe-area-inset-left));
+  }
+}
+
+// iOS Safari zooms the page when a focused input has a font-size below 16px;
+// the xterm helper textarea is invisible, so only the zoom is affected.
+.xterm .xterm-helper-textarea {
+  font-size: 16px !important;
+}
+
+.xterm .xterm-viewport {
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .xterm .xterm-viewport {
+    scrollbar-width: none;
+  }
+
+  .xterm .xterm-viewport::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
   }
 }
